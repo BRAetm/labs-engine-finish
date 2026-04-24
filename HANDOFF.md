@@ -19,6 +19,48 @@ powershell -ExecutionPolicy Bypass -File app/scripts/package.ps1
 ```
 First rebuilds `app/build/msvc-release/bin/`. Second stages `dist/LabsEngine-portable/` + zip, and an NSIS installer if makensis is available.
 
+**Repository layout:**
+```
+app/                                C++ host
+  core/                             LabsCore.dll sources (plugin IDL, fan-out, SHM override)
+  engine/                           LabsEngine.exe (main window, lifecycle)
+  plugins/                          one subdir per plugin DLL
+    display/                        stream video renderer
+    wgc_capture/                    Windows Graphics Capture source
+    xinput_input/                   XInput polling source
+    vigem_output/                   virtual X360 pad sink (Xbox mode)
+    cv_python/                      Python subprocess harness
+    ps_remote_play/                 chiaki/labs.dll → PS5
+    dualsense_input/                DualSense/DS4 HID source (bypasses XInput)
+  scripts/
+    build.ps1                       release build
+    package.ps1                     stage dist/
+    installer.nsi                   NSIS single-exe installer
+  third-party/
+    ViGEmClient/                    vendored (MIT) — statically linked into ViGEmPlugin
+    ViGEmBus/ViGEmBus_Setup.exe     kernel driver installer (shipped to users)
+    ffmpeg/                         headers + libs (exe runtime brought in by windeployqt)
+
+labs-engine/
+  scripts/                          ← what the Labs Engine left-rail UI scans
+    Labs2K.py                       target shot-timing script (use this one)
+    SecretK.py                      legacy; same monkey-patch pattern applied
+    labs_input_bridge.py            Python side of SHM override channel
+    zp_core/                        reconstructed ZP HIGHER Lite engine (read-only)
+    dev/                            diagnostics — NOT surfaced in the UI
+      test_input_bridge.py          RT pulse smoke test
+      test_ls_walk.py               LS stick smoke test
+      test_button_tap.py            Cross button smoke test
+      xinput_test.py                XInput slot sanity
+      find_ps5.py                   UDP broadcast probe
+  cv-scripts/                       imported modules (not run directly)
+    shot_meter.py                   BGR meter detector + XInput helper
+    features.py                     legacy PSControllerBridge for SecretK
+  userdata/                         runtime settings (gitignored)
+
+refence/                            prior-art clones — READ ONLY, never edit
+```
+
 ---
 
 ## The input pipeline (critical — this is where bugs live)
@@ -85,12 +127,14 @@ Labs2K.py / test_*.py  ──> labs_input_bridge.py (writes "Labs_Input_Override
 
 ---
 
-## Diagnostic scripts (ship them)
+## Diagnostic scripts
 
-Under `labs-engine/scripts/`:
+Under `labs-engine/scripts/dev/` (subfolder so the UI's top-level script picker doesn't show them to end users):
 - `test_input_bridge.py` — pulses RT=255 every second. Use to verify SHM round-trip end-to-end without needing a game.
 - `test_ls_walk.py` — alternates LS forward/back every 1s. Character should walk visibly.
 - `test_button_tap.py` — taps Cross every 2s. Use on the PS5 home screen to verify button override.
+- `xinput_test.py` — prints any XInput gamepad state for ~10s. Sanity-check pads.
+- `find_ps5.py` — standalone UDP broadcast PS5 discovery probe.
 
 These are the first things to run when debugging. If they all work but Labs2K doesn't fire in-game, the problem is detection, not the input bridge.
 
@@ -108,9 +152,7 @@ These are the first things to run when debugging. If they all work but Labs2K do
 1. **Python runtime not bundled.** Scripts need PySide6, numpy, opencv-python, bettercam, vgamepad. Consumer needs Python 3.11+ installed and a `pip install` run. Add `setup.ps1` + `requirements.txt` OR bundle embedded Python (~200MB extra).
 2. **Unsigned exe** — SmartScreen warning on first launch. Code-signing cert needed long-term; document click-through in README short-term.
 3. **No custom icon** — LabsEngine.exe has the default Qt/cmake icon.
-4. **Script folder is noisy** — consumers will see diagnostic scripts like `test_*.py`, `xinput_test.py`, `find_ps5.py`, the `zp_core/` module folder, `labs2kmain.py` (orphaned). Move diagnostics to a `dev/` subfolder the UI doesn't scan.
-5. **Dead code:** `ZP_Higher_Lite.py` references a `zp_higher_lite/` folder that was deleted. Clicking it will fail. Delete the launcher.
-6. No auto-update, no telemetry, no crash reporting. Post-launch adds.
+4. No auto-update, no telemetry, no crash reporting. Post-launch adds.
 
 ---
 
