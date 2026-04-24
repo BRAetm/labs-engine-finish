@@ -24,24 +24,26 @@ if not st["slots"]:
     print("WARN: no controller plugged in. Plug one in and re-run, "
           "OR press something now — live poll runs for 10s.")
 
-print("\nLive poll (10s) — move sticks / press buttons:")
+print("\nLive poll (10s) — move sticks / press buttons (scanning ALL 4 slots):")
 print("-" * 60)
 
-last = None
-end  = time.perf_counter() + 10.0
+last_per_slot = {0: None, 1: None, 2: None, 3: None}
+end = time.perf_counter() + 10.0
 while time.perf_counter() < end:
-    gp = _read_xinput(0)
-    if gp:
+    for slot in range(4):
+        gp = _read_xinput(slot)
+        if gp is None:
+            continue
         sig = (gp.wButtons,
                gp.bLeftTrigger // 32, gp.bRightTrigger // 32,
                gp.sThumbLX // 4096, gp.sThumbLY // 4096,
                gp.sThumbRX // 4096, gp.sThumbRY // 4096)
-        if sig != last:
-            print(f"btn=0x{gp.wButtons:04X}  "
+        if sig != last_per_slot[slot]:
+            print(f"slot{slot}  btn=0x{gp.wButtons:04X}  "
                   f"LT={gp.bLeftTrigger:3d} RT={gp.bRightTrigger:3d}  "
                   f"LS=({gp.sThumbLX:+6d},{gp.sThumbLY:+6d})  "
                   f"RS=({gp.sThumbRX:+6d},{gp.sThumbRY:+6d})")
-            last = sig
+            last_per_slot[slot] = sig
     time.sleep(1.0 / 100)
 
 print("-" * 60)

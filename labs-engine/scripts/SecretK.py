@@ -198,20 +198,71 @@ QLabel#licenseChip[state="active"] {{
 
 
 # ── engine backend ─────────────────────────────────────────────────────────────
-# All capture / detection / gamepad logic lives in labs2kmain.run().
-# This file owns only the UI; it builds a settings dict from UI state
-# and hands it to the backend on Start.
+# Self-contained: captures the Labs Engine stream window, runs the BGR shot
+# meter detector, fires a release pulse via the virtual pad. No labs2kmain.
+sys.path.insert(0, str(ROOT.parent / "cv-scripts"))
 try:
-    import labs2kmain
-    try:
-        from network_optimizer import apply as _net_apply, restore as _net_restore
-        _NETOPT_OK = True
-    except ImportError:
-        _NETOPT_OK = False
+    from shot_meter import ShotMeterDetector, find_window, _read_xinput  # noqa: E402
+    from features   import PSControllerBridge                              # noqa: E402
     ENGINE_OK = True
-except Exception:
+except Exception as _ex:
+    print(f"[ENGINE] import failed: {_ex}", flush=True)
     ENGINE_OK = False
+
+# ── Bridge: route through SHM, kill vgamepad pad creation ────────────────────
+# Two problems with the legacy PSControllerBridge in features.py:
+#   1. It creates VDS4Gamepad + VX360Gamepad. The VX360 registers as XInput
+#      slot 0; LabsEngine's XInputPlugin polls it 125Hz pushing all-neutral
+#      state into the fan-out, drowning out the real DualSense input.
+#   2. Its _fire_rt writes to those virtual pads — which the PS5 doesn't see
+#      because the PS5 only gets input via the Labs Engine PS Remote Play
+#      pipeline (DualSenseSource → fan-out → chiaki), not via random Windows
+#      virtual pads.
+# We fix both by monkey-patching __init__ to skip pad creation and _fire_rt
+# to write the Labs Engine SHM override instead.
+if ENGINE_OK:
+    try:
+        import labs_input_bridge as _shm_io  # noqa: E402
+        _orig_br_init = PSControllerBridge.__init__
+        def _patched_init(self):
+            _orig_br_init(self)
+            self.ds4  = None
+            self.x360 = None
+        PSControllerBridge.__init__ = _patched_init
+
+        def _patched_fire_rt(self):
+            _shm_io.fire_combo(duration_ms=80)
+        PSControllerBridge._fire_rt = _patched_fire_rt
+
+        def _patched_fire_shot(self, l2=False, tempo=False, tempo_ms=39):
+            if tempo and not l2:
+                time.sleep(tempo_ms / 1000.0)
+            self._fire_rt()
+        PSControllerBridge.fire_shot = _patched_fire_shot
+        print("[ENGINE] SHM bridge patches applied", flush=True)
+    except Exception as _ex:
+        print(f"[ENGINE] SHM patch failed: {_ex}", flush=True)
+
+import queue as _queue
+
+try:
+    from network_optimizer import apply as _net_apply, restore as _net_restore
+    _NETOPT_OK = True
+except ImportError:
     _NETOPT_OK = False
+
+try:
+    import bettercam
+    _BC_OK = True
+except ImportError:
+    _BC_OK = False
+try:
+    import mss
+    import numpy as np
+    import cv2  # noqa: F401
+    _MSS_OK = True
+except ImportError:
+    _MSS_OK = False
 
 
 class EngineRunner:
@@ -253,29 +304,195 @@ class EngineRunner:
         self._stop.set()
 
     def _loop(self):
-        """Build a settings dict from UI state and hand off to labs2kmain.run()."""
-        cfg = {
-            "threshold":      self.threshold_normal,
-            "threshold_l2":   self.threshold_l2,
-            "tempo":          self.tempo,
-            "tempo_ms":       self.tempo_ms,
-            "stick_tempo":    self.stick_tempo_enabled,
-            "quickstop":      self.quickstop_enabled,
-            "defense":        self.defense_enabled,
-            "stamina":        self.infinite_stamina,
-            "no_hands_up":    not self.defense_auto_hands_up,
-            "gpu":            self.gpu_index,
-            "low_end":        self.lite_mode,
-            "capture":        "mss" if self.lite_mode else "bettercam",
-        }
-
-        def _on_shot(n: int, l2: bool):
-            self.shots = n
-
+        """
+        Threaded capture → detect → release. Architecture lifted from the
+        original ZP HIGHER Lite engine: a capture thread feeds a 2-frame
+        bounded queue; a detect thread consumes it. Decoupling means detect
+        never starves capture and vice versa, and target_fps actually holds.
+        """
         try:
-            labs2kmain.run(cfg, stop_event=self._stop, on_shot=_on_shot)
+            region = find_window()
         except Exception as ex:
-            print(f"[ENGINE] backend error: {ex}", flush=True)
+            print(f"[ENGINE] find_window failed: {ex}", flush=True)
+            return
+        win = (region["left"], region["top"],
+               region["left"] + region["width"],
+               region["top"]  + region["height"])
+        print(f"[ENGINE] window {region['width']}x{region['height']} @ {win[0]},{win[1]}", flush=True)
+
+        cam, sct, mss_region = None, None, None
+        # NBA 2K runs at 60Hz; capturing faster just burns CPU on duplicate
+        # frames. 60 = every fresh frame the game produces.
+        target_fps = 30 if self.lite_mode else 60
+        if not self.lite_mode and _BC_OK:
+            try:
+                cam = bettercam.create(device_idx=self.gpu_index, output_color="BGR")
+                cam.start(region=win, target_fps=target_fps, video_mode=True)
+                print(f"[ENGINE] capture: bettercam @ {target_fps}fps", flush=True)
+            except Exception as ex:
+                print(f"[ENGINE] BetterCam unavailable ({ex}) — using mss", flush=True)
+                cam = None
+        if cam is None:
+            if not _MSS_OK:
+                print("[ENGINE] no capture backend (need bettercam or mss)", flush=True); return
+            sct = mss.mss()
+            mss_region = {"left": win[0], "top": win[1],
+                          "width": win[2]-win[0], "height": win[3]-win[1]}
+            print("[ENGINE] capture: mss (CPU)", flush=True)
+
+        # Detector (BGR contour-based, ported from ZP) + virtual-pad bridge.
+        detector = ShotMeterDetector(self.threshold_normal, self.threshold_l2)
+        bridge   = PSControllerBridge()
+        bridge.defense_enabled     = self.defense_enabled
+        bridge.infinite_stamina    = self.infinite_stamina
+        bridge.stick_tempo_enabled = self.stick_tempo_enabled
+        bridge.quickstop_enabled   = self.quickstop_enabled
+
+        # 500Hz physical → virtual pad passthrough.
+        def passthrough_loop():
+            iv = 1.0 / 500.0
+            while not self._stop.is_set():
+                gp = _read_xinput(0)
+                bridge.passthrough(gp)
+                if bridge._qs_toggle_requested:
+                    bridge.defense_enabled = not bridge.defense_enabled
+                    bridge._qs_toggle_requested = False
+                time.sleep(iv)
+        threading.Thread(target=passthrough_loop, daemon=True).start()
+
+        # Capture thread → bounded 2-frame queue. Drops oldest on overflow so
+        # detect always sees the freshest frame and we never bottleneck capture.
+        frame_q: "_queue.Queue" = _queue.Queue(maxsize=2)
+
+        def capture_loop():
+            while not self._stop.is_set():
+                try:
+                    if cam is not None:
+                        f = cam.get_latest_frame()
+                    else:
+                        bgra = np.asarray(sct.grab(mss_region))
+                        f = bgra[:, :, :3]
+                    if f is None:
+                        time.sleep(0.001); continue
+                    if frame_q.full():
+                        try: frame_q.get_nowait()
+                        except _queue.Empty: pass
+                    frame_q.put(f)
+                except Exception as ex:
+                    print(f"[ENGINE] capture error: {ex}", flush=True)
+                    time.sleep(0.05)
+
+        threading.Thread(target=capture_loop, daemon=True).start()
+
+        # Detect loop in this thread, capped at ~30Hz. NBA 2K meter only
+        # updates at 60Hz max, and the game's release window is ~100ms wide,
+        # so 30 detections/sec is plenty of timing resolution while leaving
+        # the CPU room to breathe on weak hardware.
+        DETECT_INTERVAL = 1.0 / 30.0
+        cal_n_seen = 0
+        cal_l2_seen = 0
+        last_status = 0.0
+        last_detect = 0.0
+        det_frames  = 0
+        t_window    = time.perf_counter()
+        try:
+            while not self._stop.is_set():
+                try:
+                    bgr = frame_q.get(timeout=0.1)
+                except _queue.Empty:
+                    continue
+                # Throttle detection so we don't melt the CPU when capture
+                # outpaces the game's actual meter update rate.
+                now0 = time.perf_counter()
+                if now0 - last_detect < DETECT_INTERVAL:
+                    continue
+                last_detect = now0
+                try:
+                    gp = _read_xinput(0)
+                    l2 = bool(gp and gp.bLeftTrigger > 128)
+                    if detector.check(bgr, l2=l2):
+                        if bridge.defense_enabled:
+                            bridge.contest_flick()
+                        else:
+                            bridge.fire_shot(l2=l2, tempo=self.tempo, tempo_ms=self.tempo_ms)
+                        self.shots = detector.shots_fired
+                        print(f"[ENGINE] SHOT #{self.shots}", flush=True)
+
+                    np_n  = len(detector._peak_history)
+                    np_l2 = len(detector._peak_history_l2)
+                    if np_n != cal_n_seen and not detector._calibration_locked:
+                        print(f"[CAL] normal {np_n}/4", flush=True); cal_n_seen = np_n
+                    if np_l2 != cal_l2_seen and not detector._calibration_locked_l2:
+                        print(f"[CAL] L2 {np_l2}/4", flush=True); cal_l2_seen = np_l2
+
+                    det_frames += 1
+                    now = time.perf_counter()
+                    if now - last_status >= 1.0:
+                        last_status = now
+                        elapsed = now - t_window
+                        fps = det_frames / elapsed if elapsed > 0 else 0
+                        cal = "LOCKED" if detector._calibration_locked else f"{cal_n_seen}/4"
+                        print(f"[STATUS] fps={fps:.0f} shots={self.shots} cal={cal}", flush=True)
+                        det_frames = 0; t_window = now
+                except Exception as ex:
+                    print(f"[ENGINE] frame error: {ex}", flush=True)
+                    continue
+        finally:
+            self._stop.set()
+            if cam is not None:
+                try: cam.stop()
+                except Exception: pass
+                try: cam.release()
+                except Exception: pass
+            if sct is not None:
+                try: sct.close()
+                except Exception: pass
+            print("[ENGINE] stopped", flush=True)
+
+
+def _find_meter_bbox(frame_bgr):
+    """
+    Scan a full frame for the vertical magenta+green meter pattern and return
+    a tight bbox (x, y, w, h) to track. None if not found.
+    Cheap: HSV mask + connected-components, run at ~10Hz from search phase.
+    """
+    if not _MSS_OK:  # no cv2/numpy → can't run this
+        return None
+    try:
+        import cv2 as _cv2
+        hsv = _cv2.cvtColor(frame_bgr, _cv2.COLOR_BGR2HSV)
+        H, S, V = hsv[..., 0], hsv[..., 1], hsv[..., 2]
+        mag = ((H >= 140) & (H <= 175) & (S >= 90)  & (V >= 120)).astype(np.uint8) * 255
+        grn = ((H >= 40)  & (H <= 85)  & (S >= 100) & (V >= 140)).astype(np.uint8) * 255
+        combined = _cv2.bitwise_or(mag, grn)
+        # Dilate vertically so the magenta-then-green band fuses into one blob.
+        kernel = _cv2.getStructuringElement(_cv2.MORPH_RECT, (3, 9))
+        combined = _cv2.dilate(combined, kernel, iterations=1)
+        cnts, _h = _cv2.findContours(combined, _cv2.RETR_EXTERNAL, _cv2.CHAIN_APPROX_SIMPLE)
+        best = None
+        best_score = 0
+        for c in cnts:
+            x, y, w, h = _cv2.boundingRect(c)
+            # Meter is tall + narrow. Reject squat or tiny shapes.
+            if h < 40 or h > 400: continue
+            if w < 4  or w > 80:  continue
+            if h / max(w, 1) < 2.0: continue
+            # Require BOTH colors inside this candidate bbox.
+            crop_mag = mag[y:y+h, x:x+w].sum()
+            crop_grn = grn[y:y+h, x:x+w].sum()
+            if crop_mag == 0 or crop_grn == 0: continue
+            score = h * (w + 4)
+            if score > best_score:
+                best_score = score
+                # Pad a bit so we catch edge anti-aliased pixels.
+                pad = 3
+                bx = max(0, x - pad); by = max(0, y - pad)
+                bw = w + 2*pad; bh = h + 2*pad
+                best = (bx, by, bw, bh)
+        return best
+    except Exception as ex:
+        print(f"[ENGINE] _find_meter_bbox error: {ex}", flush=True)
+        return None
 
 
 _engine = EngineRunner()

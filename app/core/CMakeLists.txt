@@ -7,6 +7,8 @@ add_library(LabsCore SHARED
     PluginHost.cpp
     SettingsManager.h
     SettingsManager.cpp
+    InputOverride.h
+    InputOverride.cpp
 )
 
 target_compile_definitions(LabsCore PRIVATE LABSCORE_EXPORTS)

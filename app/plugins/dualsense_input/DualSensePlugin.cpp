@@ -1,8 +1,8 @@
 #include "DualSensePlugin.h"
 
+#include <QDateTime>
 #include <QDebug>
 #include <QString>
-#include <QStringList>
 
 #include <Windows.h>
 #include <SetupAPI.h>
@@ -16,9 +16,9 @@ extern "C" {
 
 namespace Labs {
 
-// ── HID identifiers ──────────────────────────────────────────────────────────
-static constexpr USHORT kSonyVid      = 0x054C;
-static constexpr USHORT kPidDualSense = 0x0CE6;
+// ── Sony HID identifiers ─────────────────────────────────────────────────────
+static constexpr USHORT kSonyVid          = 0x054C;
+static constexpr USHORT kPidDualSense     = 0x0CE6;
 static constexpr USHORT kPidDualSenseEdge = 0x0DF2;
 static constexpr USHORT kPidDualShock4_v1 = 0x05C4;
 static constexpr USHORT kPidDualShock4_v2 = 0x09CC;
@@ -29,88 +29,26 @@ static bool isSupportedPid(USHORT pid)
         || pid == kPidDualShock4_v1 || pid == kPidDualShock4_v2;
 }
 
-// ── ViGEmClient.dll runtime load (mirrors ViGEmPlugin) ───────────────────────
-struct XusbReport {
-    quint16 wButtons;
-    quint8  bLeftTrigger;
-    quint8  bRightTrigger;
-    qint16  sThumbLX;
-    qint16  sThumbLY;
-    qint16  sThumbRX;
-    qint16  sThumbRY;
-};
-
-using FN_alloc        = void* (*)();
-using FN_free         = void  (*)(void*);
-using FN_connect      = int   (*)(void*);
-using FN_disconnect   = void  (*)(void*);
-using FN_x360_alloc   = void* (*)();
-using FN_target_add   = int   (*)(void*, void*);
-using FN_target_remove= int   (*)(void*, void*);
-using FN_target_free  = void  (*)(void*);
-using FN_x360_update  = int   (*)(void*, void*, XusbReport);
-
-struct Vigem {
-    HMODULE dll = nullptr;
-    void*   client = nullptr;
-    void*   x360   = nullptr;
-    FN_alloc         alloc = nullptr;
-    FN_free          free_ = nullptr;
-    FN_connect       connect_ = nullptr;
-    FN_disconnect    disconnect_ = nullptr;
-    FN_x360_alloc    x360_alloc = nullptr;
-    FN_target_add    target_add = nullptr;
-    FN_target_remove target_remove = nullptr;
-    FN_target_free   target_free = nullptr;
-    FN_x360_update   x360_update = nullptr;
-
-    bool load() {
-        dll = ::LoadLibraryW(L"ViGEmClient.dll");
-        if (!dll) return false;
-        alloc        = reinterpret_cast<FN_alloc>        (::GetProcAddress(dll, "vigem_alloc"));
-        free_        = reinterpret_cast<FN_free>         (::GetProcAddress(dll, "vigem_free"));
-        connect_     = reinterpret_cast<FN_connect>      (::GetProcAddress(dll, "vigem_connect"));
-        disconnect_  = reinterpret_cast<FN_disconnect>   (::GetProcAddress(dll, "vigem_disconnect"));
-        x360_alloc   = reinterpret_cast<FN_x360_alloc>   (::GetProcAddress(dll, "vigem_target_x360_alloc"));
-        target_add   = reinterpret_cast<FN_target_add>   (::GetProcAddress(dll, "vigem_target_add"));
-        target_remove= reinterpret_cast<FN_target_remove>(::GetProcAddress(dll, "vigem_target_remove"));
-        target_free  = reinterpret_cast<FN_target_free>  (::GetProcAddress(dll, "vigem_target_free"));
-        x360_update  = reinterpret_cast<FN_x360_update>  (::GetProcAddress(dll, "vigem_target_x360_update"));
-        return alloc && free_ && connect_ && disconnect_
-            && x360_alloc && target_add && target_remove && target_free && x360_update;
-    }
-
-    bool createPad() {
-        client = alloc();
-        if (!client || connect_(client) != 0) return false;
-        x360 = x360_alloc();
-        if (!x360 || target_add(client, x360) != 0) return false;
-        return true;
-    }
-
-    void shutdown() {
-        if (x360 && client) target_remove(client, x360);
-        if (x360)           target_free(x360);
-        if (client)         { disconnect_(client); free_(client); }
-        if (dll)            ::FreeLibrary(dll);
-        x360 = nullptr; client = nullptr; dll = nullptr;
-    }
-
-    void send(const XusbReport& r) {
-        if (client && x360) x360_update(client, x360, r);
-    }
-};
-
-// ── HID enum + reader ────────────────────────────────────────────────────────
 struct HidDevicePath {
     QString path;
     USHORT  pid = 0;
-    bool    isDualSense() const { return pid == kPidDualSense || pid == kPidDualSenseEdge; }
 };
 
-static std::vector<HidDevicePath> enumPlaystationHids()
+struct HidProbe {
+    QString path;
+    USHORT  pid = 0;
+    USHORT  usagePage = 0;
+    USHORT  usage     = 0;
+    USHORT  inputReportLen = 0;
+};
+
+// Enumerate Sony HID collections and keep only the ones whose top-level
+// collection is a Gamepad / Joystick on the Generic Desktop page. DualSense
+// exposes multiple interfaces (keyboard emulation, audio, gamepad). Opening
+// the wrong one gives garbage reports — exactly the symptom the user hit.
+static std::vector<HidProbe> enumPlaystationHids()
 {
-    std::vector<HidDevicePath> out;
+    std::vector<HidProbe> out;
     GUID hidGuid;
     HidD_GetHidGuid(&hidGuid);
 
@@ -138,119 +76,151 @@ static std::vector<HidDevicePath> enumPlaystationHids()
         if (h == INVALID_HANDLE_VALUE) continue;
 
         HIDD_ATTRIBUTES attr{}; attr.Size = sizeof(attr);
-        if (HidD_GetAttributes(h, &attr) && attr.VendorID == kSonyVid && isSupportedPid(attr.ProductID)) {
-            HidDevicePath d;
-            d.path = path;
-            d.pid  = attr.ProductID;
-            out.push_back(d);
+        if (!HidD_GetAttributes(h, &attr) || attr.VendorID != kSonyVid || !isSupportedPid(attr.ProductID)) {
+            ::CloseHandle(h);
+            continue;
+        }
+
+        HidProbe p;
+        p.path = path;
+        p.pid  = attr.ProductID;
+
+        PHIDP_PREPARSED_DATA pre = nullptr;
+        if (HidD_GetPreparsedData(h, &pre) && pre) {
+            HIDP_CAPS caps{};
+            if (HidP_GetCaps(pre, &caps) == HIDP_STATUS_SUCCESS) {
+                p.usagePage      = caps.UsagePage;
+                p.usage          = caps.Usage;
+                p.inputReportLen = caps.InputReportByteLength;
+            }
+            HidD_FreePreparsedData(pre);
         }
         ::CloseHandle(h);
+
+        // Only keep the gamepad top-level collection. Generic Desktop page (0x01),
+        // Gamepad (0x05) or Joystick (0x04).
+        if (p.usagePage == 0x01 && (p.usage == 0x05 || p.usage == 0x04)) {
+            out.push_back(p);
+        }
     }
     SetupDiDestroyDeviceInfoList(devInfo);
     return out;
 }
 
-// XInput button bits — same numeric values as XInput.h
-constexpr quint16 XI_DPAD_UP    = 0x0001;
-constexpr quint16 XI_DPAD_DOWN  = 0x0002;
-constexpr quint16 XI_DPAD_LEFT  = 0x0004;
-constexpr quint16 XI_DPAD_RIGHT = 0x0008;
-constexpr quint16 XI_START      = 0x0010;
-constexpr quint16 XI_BACK       = 0x0020;
-constexpr quint16 XI_LSTICK     = 0x0040;
-constexpr quint16 XI_RSTICK     = 0x0080;
-constexpr quint16 XI_LB         = 0x0100;
-constexpr quint16 XI_RB         = 0x0200;
-constexpr quint16 XI_A          = 0x1000;
-constexpr quint16 XI_B          = 0x2000;
-constexpr quint16 XI_X          = 0x4000;
-constexpr quint16 XI_Y          = 0x8000;
+// DualSense and DualShock 4 share the sticks/dpad encoding but the offsets of
+// the button bytes differ. Both pads emit report ID 0x01 so we must branch on
+// PID. Layouts (the first data byte after report ID is index 1):
+//
+//   DualShock 4 USB (PID 0x05C4, 0x09CC):
+//     [1..4] sticks  LX,LY,RX,RY
+//     [5]    dpad + face buttons     (SQUARE=0x10, X=0x20, CIRCLE=0x40, TRI=0x80)
+//     [6]    L1/R1/L2c/R2c + SHARE/OPTIONS + L3/R3
+//     [7]    PS/TPAD + counter
+//     [8]    L2 analog
+//     [9]    R2 analog
+//
+//   DualSense USB (PID 0x0CE6, 0x0DF2):
+//     [1..4] sticks  LX,LY,RX,RY
+//     [5]    L2 analog
+//     [6]    R2 analog
+//     [7]    sequence counter
+//     [8]    dpad + face buttons
+//     [9]    L1/R1/L2c/R2c + CREATE/OPTIONS + L3/R3
+//     [10]   PS/mute/touchpad
+enum class Layout { Ds4Compat, DualSenseFull };
 
-// DualSense USB input report layout (offsets into the 64-byte report)
-//   [0]    = report id (0x01 over USB)
-//   [1..4] = LX, LY, RX, RY  (0..255, center 128)
-//   [5..6] = L2, R2 trigger pressure
-//   [8]    = digital buttons + dpad   (low nibble = dpad, high nibble = ◯△□✕)
-//   [9]    = shoulders + sticks       (L1, R1, L2 click, R2 click, Share, Options, L3, R3)
-//   [10]   = misc
-static XusbReport mapDualSenseReport(const BYTE* r)
+// Windows enumerates both DS4 and DualSense in "DS4 compat" mode by default
+// (report id 0x01, dpad+buttons at [5], triggers at [8..9]). A DualSense only
+// switches to its full 64-byte layout (sticks/triggers first, buttons at [8])
+// after we send a feature report — which we don't. Detect by dpad location:
+// at idle the dpad low nibble == 0x08 (neutral). If that's at byte 5, we're
+// in DS4 compat; if at byte 8, full DualSense.
+static ControllerState mapReport(const BYTE* r, Layout layout)
 {
-    XusbReport x{};
-
-    // Sticks: 0..255 centered at 128 → -32768..32767. Y inverted (DualSense up
-    // is high value, XInput up is positive).
+    ControllerState s;
+    // Clamp to ±32767 (not -32768) so callers can safely negate the result —
+    // negating qint16(-32768) overflows back to -32768, which manifested as
+    // "stick fully up gets sent as fully down" downstream.
     auto cnv = [](BYTE v) -> qint16 {
-        const int s = int(v) - 128;
-        return qint16(qBound(-32768, s * 257, 32767));
+        const int c = (int(v) - 128) * 257;
+        return qint16(qBound(-32767, c, 32767));
     };
-    x.sThumbLX =  cnv(r[1]);
-    x.sThumbLY = -cnv(r[2]);
-    x.sThumbRX =  cnv(r[3]);
-    x.sThumbRY = -cnv(r[4]);
+    s.leftThumbX  =  cnv(r[1]);
+    s.leftThumbY  = -cnv(r[2]);
+    s.rightThumbX =  cnv(r[3]);
+    s.rightThumbY = -cnv(r[4]);
 
-    x.bLeftTrigger  = r[5];
-    x.bRightTrigger = r[6];
-
-    const BYTE btns8 = r[8];
-    const BYTE dpad  = btns8 & 0x0F;
-    // DualSense dpad encoding: 0=up, 1=upright, ..., 7=upleft, 8=neutral
-    quint16 dp = 0;
-    switch (dpad) {
-        case 0: dp = XI_DPAD_UP; break;
-        case 1: dp = XI_DPAD_UP   | XI_DPAD_RIGHT; break;
-        case 2: dp = XI_DPAD_RIGHT; break;
-        case 3: dp = XI_DPAD_DOWN | XI_DPAD_RIGHT; break;
-        case 4: dp = XI_DPAD_DOWN; break;
-        case 5: dp = XI_DPAD_DOWN | XI_DPAD_LEFT; break;
-        case 6: dp = XI_DPAD_LEFT; break;
-        case 7: dp = XI_DPAD_UP   | XI_DPAD_LEFT; break;
-        default: dp = 0; break;
+    BYTE btnBits, shoulderBits, extraBits;
+    BYTE l2, r2;
+    if (layout == Layout::DualSenseFull) {
+        l2           = r[5];
+        r2           = r[6];
+        btnBits      = r[8];
+        shoulderBits = r[9];
+        extraBits    = r[10];
+    } else {
+        btnBits      = r[5];
+        shoulderBits = r[6];
+        extraBits    = r[7];
+        l2           = r[8];
+        r2           = r[9];
     }
-    quint16 buttons = dp;
-    if (btns8 & 0x10) buttons |= XI_X;   // Square  → X
-    if (btns8 & 0x20) buttons |= XI_A;   // Cross   → A
-    if (btns8 & 0x40) buttons |= XI_B;   // Circle  → B
-    if (btns8 & 0x80) buttons |= XI_Y;   // Triangle→ Y
+    s.leftTrigger  = l2;
+    s.rightTrigger = r2;
 
-    const BYTE btns9 = r[9];
-    if (btns9 & 0x01) buttons |= XI_LB;     // L1
-    if (btns9 & 0x02) buttons |= XI_RB;     // R1
-    if (btns9 & 0x10) buttons |= XI_BACK;   // Share
-    if (btns9 & 0x20) buttons |= XI_START;  // Options
-    if (btns9 & 0x40) buttons |= XI_LSTICK; // L3
-    if (btns9 & 0x80) buttons |= XI_RSTICK; // R3
+    const BYTE dpad = btnBits & 0x0F;
+    quint16 buttons = 0;
+    switch (dpad) {
+        case 0: buttons |= ButtonDpadUp; break;
+        case 1: buttons |= ButtonDpadUp    | ButtonDpadRight; break;
+        case 2: buttons |= ButtonDpadRight; break;
+        case 3: buttons |= ButtonDpadDown  | ButtonDpadRight; break;
+        case 4: buttons |= ButtonDpadDown; break;
+        case 5: buttons |= ButtonDpadDown  | ButtonDpadLeft; break;
+        case 6: buttons |= ButtonDpadLeft; break;
+        case 7: buttons |= ButtonDpadUp    | ButtonDpadLeft; break;
+        default: break;
+    }
+    if (btnBits & 0x10) buttons |= ButtonX;   // Square   → X
+    if (btnBits & 0x20) buttons |= ButtonA;   // Cross    → A
+    if (btnBits & 0x40) buttons |= ButtonB;   // Circle   → B
+    if (btnBits & 0x80) buttons |= ButtonY;   // Triangle → Y
 
-    x.wButtons = buttons;
-    return x;
+    if (shoulderBits & 0x01) buttons |= ButtonLeftShoulder;
+    if (shoulderBits & 0x02) buttons |= ButtonRightShoulder;
+    if (shoulderBits & 0x10) buttons |= ButtonBack;   // Share/Create → Back
+    if (shoulderBits & 0x20) buttons |= ButtonStart;  // Options      → Start
+    if (shoulderBits & 0x40) buttons |= ButtonLeftThumb;
+    if (shoulderBits & 0x80) buttons |= ButtonRightThumb;
+
+    if (extraBits & 0x01) buttons |= ButtonGuide;     // PS → Guide
+
+    s.buttons     = buttons;
+    s.connected   = true;
+    s.slot        = 0;
+    s.timestampUs = QDateTime::currentMSecsSinceEpoch() * 1000;
+    return s;
 }
 
-// ── Plugin Impl ──────────────────────────────────────────────────────────────
-struct DualSensePlugin::Impl {
-    Vigem               vigem;
-    std::atomic<bool>   running{false};
-    std::thread         readerThread;
-    HANDLE              hidHandle = INVALID_HANDLE_VALUE;
-    USHORT              pid = 0;
-
-    void start() {
-        running.store(true);
-        readerThread = std::thread([this]{ runReader(); });
-    }
-
-    void stop() {
-        running.store(false);
-        if (hidHandle != INVALID_HANDLE_VALUE) ::CancelIoEx(hidHandle, nullptr);
-        if (readerThread.joinable()) readerThread.join();
-        if (hidHandle != INVALID_HANDLE_VALUE) { ::CloseHandle(hidHandle); hidHandle = INVALID_HANDLE_VALUE; }
-        vigem.shutdown();
-    }
+// ── DualSenseSource impl ─────────────────────────────────────────────────────
+struct DualSenseSource::Impl {
+    DualSenseSource*   owner  = nullptr;
+    std::thread        readerThread;
+    HANDLE             hidHandle = INVALID_HANDLE_VALUE;
+    USHORT             pid = 0;
 
     void runReader() {
-        // Loop: scan for a controller, open it, read until disconnect, repeat.
-        while (running.load()) {
+        while (owner->m_running.load()) {
             auto devs = enumPlaystationHids();
             if (devs.empty()) {
-                ::Sleep(800);
+                // Emit a disconnected tick so any UI reflects "no pad".
+                if (owner->m_sink) {
+                    ControllerState s;
+                    s.connected = false;
+                    s.timestampUs = QDateTime::currentMSecsSinceEpoch() * 1000;
+                    owner->m_sink->pushState(s);
+                }
+                ::Sleep(1000);
                 continue;
             }
             const auto d = devs.front();
@@ -259,26 +229,26 @@ struct DualSensePlugin::Impl {
                                       GENERIC_READ | GENERIC_WRITE,
                                       FILE_SHARE_READ | FILE_SHARE_WRITE,
                                       nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
-            if (hidHandle == INVALID_HANDLE_VALUE) {
-                ::Sleep(500);
-                continue;
-            }
+            if (hidHandle == INVALID_HANDLE_VALUE) { ::Sleep(500); continue; }
             pid = d.pid;
-            qInfo().noquote() << "[DualSense] connected — pid=0x"
-                              << QString::number(d.pid, 16).toUpper();
+            qInfo().noquote() << QStringLiteral("[DualSense] connected — pid=0x%1 usage=0x%2 reportLen=%3")
+                                     .arg(d.pid, 4, 16, QLatin1Char('0'))
+                                     .arg(d.usage, 4, 16, QLatin1Char('0'))
+                                     .arg(d.inputReportLen);
 
-            // Read loop
-            BYTE buf[78] = {0};
+            BYTE buf[128] = {0};
+            bool dumpedFirst = false;
+            Layout layout = Layout::Ds4Compat;  // default; auto-detected below
             OVERLAPPED ov{};
             ov.hEvent = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
-            while (running.load()) {
+            while (owner->m_running.load()) {
                 ::ResetEvent(ov.hEvent);
                 DWORD got = 0;
                 BOOL ok = ::ReadFile(hidHandle, buf, sizeof(buf), &got, &ov);
                 if (!ok && ::GetLastError() == ERROR_IO_PENDING) {
                     DWORD wait = ::WaitForSingleObject(ov.hEvent, 1000);
                     if (wait != WAIT_OBJECT_0) {
-                        if (!running.load()) break;
+                        if (!owner->m_running.load()) break;
                         continue;
                     }
                     ok = ::GetOverlappedResult(hidHandle, &ov, &got, FALSE);
@@ -287,52 +257,92 @@ struct DualSensePlugin::Impl {
                     qInfo() << "[DualSense] disconnected";
                     break;
                 }
-                // Report id at byte 0 — DualSense USB is 0x01.
-                // Bluetooth uses 0x31 with extra header bytes; offset by 1 to align.
+                // USB: buf[0] == 0x01 and bytes line up with our USB layout
+                // (report id at [0], LX at [1]).
+                // BT: DualSense emits report 0x31 (>= 78 bytes), which has one
+                //   "tag" byte between the report id and the USB-equivalent
+                //   payload, so the payload starts at buf[2] and "LX" — which
+                //   our mapping reads at report[1] — must come from buf[2].
+                //   Shift by +1 (not +2) so report[1] == buf[2].
+                // DS4 BT uses report 0x11 with a similar two-byte prefix.
                 const BYTE* report = buf;
-                if (got >= 78 && buf[0] == 0x31) report = buf + 2;  // BT layout
+                if (got >= 78 && (buf[0] == 0x31 || buf[0] == 0x11)) {
+                    report = buf + 1;
+                }
+                if (got < 10) continue;
 
-                XusbReport x = mapDualSenseReport(report);
-                vigem.send(x);
+                if (!dumpedFirst) {
+                    dumpedFirst = true;
+                    // Auto-detect layout: dpad-neutral is 0x8 in the low nibble
+                    // of whichever button byte the device uses. Check both
+                    // candidate positions and pick whichever looks neutral at
+                    // the moment of first read (user isn't pressing anything).
+                    const BYTE lo5 = report[5] & 0x0F;
+                    const BYTE lo8 = report[8] & 0x0F;
+                    if (lo8 == 0x8 && lo5 != 0x8) layout = Layout::DualSenseFull;
+                    else                          layout = Layout::Ds4Compat;
+
+                    const int n = qMin(DWORD(16), got);
+                    QString hex;
+                    for (int k = 0; k < n; ++k) hex += QString::asprintf("%02X ", buf[k]);
+                    qInfo().noquote() << QStringLiteral("[DualSense] first report (%1 bytes): %2  → layout=%3")
+                                             .arg(got).arg(hex.trimmed())
+                                             .arg(layout == Layout::DualSenseFull ? "DualSenseFull" : "Ds4Compat");
+                }
+
+                ControllerState s = mapReport(report, layout);
+                // Override application moved to FanOutCtrlSink — see
+                // app/engine/LabsMainWindow.cpp. Doing it per-source loses
+                // the race against XInputSource pushes; doing it at the
+                // fan-out covers every source uniformly.
+                if (owner->m_sink) owner->m_sink->pushState(s);
             }
             ::CloseHandle(ov.hEvent);
             ::CloseHandle(hidHandle);
             hidHandle = INVALID_HANDLE_VALUE;
         }
     }
+
+    void start() {
+        owner->m_running.store(true);
+        readerThread = std::thread([this]{ runReader(); });
+    }
+
+    void stop() {
+        owner->m_running.store(false);
+        if (hidHandle != INVALID_HANDLE_VALUE) ::CancelIoEx(hidHandle, nullptr);
+        if (readerThread.joinable()) readerThread.join();
+        if (hidHandle != INVALID_HANDLE_VALUE) { ::CloseHandle(hidHandle); hidHandle = INVALID_HANDLE_VALUE; }
+    }
 };
 
-// ── Plugin lifecycle ─────────────────────────────────────────────────────────
-DualSensePlugin::DualSensePlugin()
-    : m_impl(std::make_unique<Impl>())
-{}
-
-DualSensePlugin::~DualSensePlugin()
+DualSenseSource::DualSenseSource(QObject* parent)
+    : QObject(parent), m_impl(std::make_unique<Impl>())
 {
-    if (m_impl) m_impl->stop();
+    m_impl->owner = this;
 }
 
-void DualSensePlugin::initialize(const PluginContext&)
+DualSenseSource::~DualSenseSource() { stop(); }
+
+bool DualSenseSource::start()
 {
-    if (!m_impl->vigem.load()) {
-        m_status = QStringLiteral("ViGEmClient.dll missing");
-        qWarning() << "[DualSense]" << m_status;
-        return;
-    }
-    if (!m_impl->vigem.createPad()) {
-        m_status = QStringLiteral("ViGEm pad create failed");
-        qWarning() << "[DualSense]" << m_status;
-        return;
-    }
+    if (m_running.load()) return true;
     m_impl->start();
-    m_status = QStringLiteral("watching for DualSense / DualShock 4");
-    qInfo() << "[DualSense]" << m_status;
+    qInfo() << "[DualSense] source started";
+    return true;
 }
 
-void DualSensePlugin::shutdown()
+void DualSenseSource::stop()
 {
-    if (m_impl) m_impl->stop();
+    if (!m_running.load()) return;
+    m_impl->stop();
 }
+
+// ── Plugin ───────────────────────────────────────────────────────────────────
+DualSensePlugin::DualSensePlugin()
+    : m_source(std::make_unique<DualSenseSource>(this)) {}
+
+DualSensePlugin::~DualSensePlugin() = default;
 
 } // namespace Labs
 

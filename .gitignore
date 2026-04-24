@@ -1,4 +1,5 @@
 app/build/
+dist/
 out/
 *.user
 *.user.*
@@ -18,6 +19,11 @@ Makefile
 *.obj
 *.o
 *.exp
+
+# Exception: bundled ViGEmBus installer ships with the source so the
+# packaging script can pick it up. Tighten this pattern to the specific
+# path so we don't accidentally track ffmpeg.exe or other tooling.
+!app/third-party/ViGEmBus/*.exe
 
 aqtinstall.log
 

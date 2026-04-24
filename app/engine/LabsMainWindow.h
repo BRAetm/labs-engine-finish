@@ -109,6 +109,7 @@ private:
     QLabel*          m_tabMonitor  = nullptr;
     ControllerMonitorWidget* m_monitor = nullptr;
     IControllerSource* m_xinputSource = nullptr;   // always-on feed for the monitor
+    IControllerSource* m_dualSenseSource = nullptr; // HID-based PS pad source, feeds same fan-out
 
     // Right rail.
     QLabel*      m_devicesList = nullptr;

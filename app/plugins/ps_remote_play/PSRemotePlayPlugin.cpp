@@ -292,7 +292,18 @@ void PSRemotePlayPlugin::stop()
 
 void PSRemotePlayPlugin::pushState(const ControllerState& state)
 {
-    if (!m_running.load() || !m_impl->sessionInited) return;
+    // One-time warning if pushes arrive before the session is up — tells us
+    // whether the test is being run with no active stream.
+    if (!m_running.load() || !m_impl->sessionInited) {
+        static bool warned_inactive = false;
+        if (!warned_inactive) {
+            warned_inactive = true;
+            qWarning() << "[PS-CTRL] dropping push — session not active "
+                          "(running=" << m_running.load()
+                       << " sessionInited=" << m_impl->sessionInited << ")";
+        }
+        return;
+    }
 
     QMutexLocker lock(&m_impl->ctrlMutex);
     LabsControllerState& cs = m_impl->ctrlState;
@@ -315,13 +326,19 @@ void PSRemotePlayPlugin::pushState(const ControllerState& state)
     if (state.buttons & ButtonBack)           buttons |= LABS_CONTROLLER_BUTTON_SHARE;
     if (state.buttons & ButtonGuide)          buttons |= LABS_CONTROLLER_BUTTON_PS;
 
+    // ControllerState uses XInput convention (Y up = positive). Chiaki / labs.dll
+    // uses Sony convention (Y up = negative, screen-style). Flip Y so "push stick up"
+    // moves the on-screen character forward, not backward.
+    auto negY = [](qint16 v) -> qint16 {
+        return (v == -32768) ? qint16(32767) : qint16(-v);
+    };
     cs.buttons  = buttons;
     cs.l2_state = state.leftTrigger;
     cs.r2_state = state.rightTrigger;
     cs.left_x   = state.leftThumbX;
-    cs.left_y   = state.leftThumbY;
+    cs.left_y   = negY(state.leftThumbY);
     cs.right_x  = state.rightThumbX;
-    cs.right_y  = state.rightThumbY;
+    cs.right_y  = negY(state.rightThumbY);
 
     labs_session_set_controller_state(&m_impl->session, &cs);
 }

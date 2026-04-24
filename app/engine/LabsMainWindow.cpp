@@ -7,6 +7,7 @@
 #include "Ps5Discovery.h"
 
 #include "IPlugin.h"
+#include "InputOverride.h"
 #include "PluginHost.h"
 #include "SettingsManager.h"
 
@@ -59,8 +60,14 @@ public:
     void setMonitor(IControllerSink* s)  { m_monitor = s; }
     void setOutput(IControllerSink* s)   { m_output  = s; }
     void pushState(const ControllerState& state) override {
-        if (m_monitor) m_monitor->pushState(state);
-        if (m_output)  m_output ->pushState(state);
+        // Apply external SHM-based overrides (Labs2K shot release etc.) HERE
+        // — at the fan-out — so EVERY source pushing through us sees the
+        // override. Doing it at individual sources lost the race against
+        // parallel pushes from XInputSource.
+        ControllerState s = state;
+        InputOverride::instance().apply(s);
+        if (m_monitor) m_monitor->pushState(s);
+        if (m_output)  m_output ->pushState(s);
     }
 private:
     IControllerSink* m_monitor = nullptr;
@@ -300,6 +307,7 @@ LabsMainWindow::LabsMainWindow(QWidget* parent)
         if (auto* sp = dynamic_cast<IControllerSourcePlugin*>(p); sp) {
             if      (p->name() == QStringLiteral("CV Python")) cvCtrlSource    = sp->controllerSource();
             else if (p->name() == QStringLiteral("XInput"))    xinputCtrlSource = sp->controllerSource();
+            else if (p->name() == QStringLiteral("DualSense")) m_dualSenseSource = sp->controllerSource();
         }
         if (p->name() == QStringLiteral("XInput")) {
             if (auto* sp = dynamic_cast<IControllerSourcePlugin*>(p))
@@ -322,6 +330,14 @@ LabsMainWindow::LabsMainWindow(QWidget* parent)
     if (m_ctrlSource) {
         m_ctrlSource->setSink(&s_ctrlFanOut);
         m_ctrlSource->start();
+    }
+    // DualSense runs in parallel so PS pads work even when ViGEmBus is absent.
+    // It pushes into the same fan-out as the primary source; the XInputSource
+    // simply emits nothing when no XInput pad is plugged in, so they don't
+    // fight. Last-write-wins is fine — only one physical pad is ever moving.
+    if (m_dualSenseSource && m_dualSenseSource != m_ctrlSource) {
+        m_dualSenseSource->setSink(&s_ctrlFanOut);
+        m_dualSenseSource->start();
     }
 
     const int savedMode = m_settings->value(QStringLiteral("session/mode"), 0).toInt();
@@ -384,6 +400,7 @@ LabsMainWindow::~LabsMainWindow()
 {
     stopActiveSource();
     if (m_ctrlSource) m_ctrlSource->stop();
+    if (m_dualSenseSource && m_dualSenseSource != m_ctrlSource) m_dualSenseSource->stop();
     if (m_scriptProc && m_scriptProc->state() != QProcess::NotRunning) {
         m_scriptProc->terminate();
         m_scriptProc->waitForFinished(1000);
@@ -767,12 +784,16 @@ void LabsMainWindow::applyMode(Mode mode)
     // connected so the pad visualization keeps updating regardless of mode.
     s_ctrlFanOut.setOutput(m_activeCtrlSink);
 
-    // In PS mode, skip XInput slot 0 (the real pad) so SecretK's virtual X360
-    // on slot 1+ is what we forward to the PS5. In Xbox mode, use all slots.
+    // No skip mask. The original design skipped slot 0 in PS mode so the
+    // physical Xbox pad wouldn't double-write with SecretK's augmented
+    // virtual pad on a higher slot. With DualSense going through its own
+    // dedicated source (DualSenseSource → fan-out, bypassing XInput entirely),
+    // the only thing on XInput slots is SecretK's vgamepad VX360 release
+    // pulses — which we WANT to forward. Last-write-wins is fine; pulses
+    // overlap user input only briefly during a release.
     if (IPlugin* xi = m_pluginsByName.value(QStringLiteral("XInput"), nullptr)) {
-        const int skipMask = (mode == Mode::PS) ? 0x01 : 0x00;
         QMetaObject::invokeMethod(xi->qobject(), "setSkipMask", Qt::DirectConnection,
-                                  Q_ARG(int, skipMask));
+                                  Q_ARG(int, 0));
     }
 
     updateActions();
