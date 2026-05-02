@@ -3,5 +3,8 @@
         <file>labs.ico</file>
         <file>labs.png</file>
         <file>xbox_controller.svg</file>
+        <file>icon_refresh.svg</file>
+        <file>icon_indicator.svg</file>
+        <file>icon_chevron_down.svg</file>
     </qresource>
 </RCC>

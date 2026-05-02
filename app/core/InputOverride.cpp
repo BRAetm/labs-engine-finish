@@ -4,14 +4,25 @@
 #include <QByteArray>
 #include <QDebug>
 #include <QString>
+#include <atomic>
 #include <chrono>
+#include <cstring>
 
 namespace Labs {
 
-// SHM name bumped to v2 — the timebase changed (raw QPC ticks instead of
-// std::chrono::steady_clock microseconds). Old Python clients using v1
-// won't accidentally write an incompatible record into our v2 namespace.
-static const wchar_t* kShmName = L"Labs_Input_Override_v2";
+// Build the wide-char SHM name once from the shared kSharedMemName constant
+// (defined in the header so the writer side and any cross-language doc
+// reference a single source of truth).
+static const std::wstring& kShmNameW()
+{
+    static const std::wstring name = []{
+        std::wstring w;
+        const char* s = kSharedMemName;
+        while (*s) w.push_back(static_cast<wchar_t>(*s++));
+        return w;
+    }();
+    return name;
+}
 
 // Raw QPC counter ticks. Identical value across processes on Windows
 // (QPC reads the same hardware counter regardless of process). Eliminates
@@ -60,11 +71,12 @@ bool InputOverride::ensure_mapped()
     // Try OpenFileMapping first (Python script may have created it). Fall
     // back to creating it ourselves so we can read what the script later
     // writes. PAGE_READWRITE both ways — Windows is permissive about this.
-    HANDLE h = ::OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, kShmName);
+    const wchar_t* name = kShmNameW().c_str();
+    HANDLE h = ::OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, name);
     if (!h) {
         h = ::CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr,
                                  PAGE_READWRITE, 0,
-                                 sizeof(InputOverrideRecord), kShmName);
+                                 sizeof(InputOverrideRecord), name);
     }
     if (!h) return false;
 
@@ -90,7 +102,35 @@ void InputOverride::apply(ControllerState& state)
         return;
     }
 
-    const uint64_t expiry = m_record->expires_qpc;
+    // Magic check — rejects an uninitialized SHM section (all zeros) and
+    // anything written by an unrelated process that happened to grab the same
+    // name. "LBSO" little-endian = 0x4F53424C.
+    {
+        char m[4];
+        std::memcpy(m, m_record->magic, 4);
+        if (m[0] != 'L' || m[1] != 'B' || m[2] != 'S' || m[3] != 'O') return;
+    }
+
+    // Seqlock read: snapshot all override fields between two reads of
+    // `sequence`. Retry if the writer was mid-update (odd seq) or if the
+    // sequence changed across the read (writer raced us). Cap at 3 attempts
+    // so the input thread never stalls on a runaway writer.
+    InputOverrideRecord snap;
+    auto* volatile seqp = reinterpret_cast<volatile uint32_t*>(&m_record->sequence);
+    bool ok = false;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        const uint32_t s1 = *seqp;
+        if (s1 & 1u) { YieldProcessor(); continue; }
+        std::atomic_thread_fence(std::memory_order_acquire);
+        std::memcpy(&snap, m_record, sizeof(snap));
+        std::atomic_thread_fence(std::memory_order_acquire);
+        const uint32_t s2 = *seqp;
+        if (s1 == s2) { ok = true; break; }
+        YieldProcessor();
+    }
+    if (!ok) return;
+
+    const uint64_t expiry = snap.expires_qpc;
     if (expiry == 0) return;
     const uint64_t cur = now_us();
     if (cur >= expiry) return;
@@ -99,17 +139,14 @@ void InputOverride::apply(ControllerState& state)
     // stale data from a process that died mid-write and ignore.
     if (expiry - cur > qpc_frequency() * 60) return;
 
-    const uint8_t  flags = m_record->flags;
-    const uint8_t  rt    = m_record->rt;
-    const uint8_t  l2    = m_record->l2;
-    const int16_t  rsy   = m_record->rs_y;
-    const int16_t  lsy   = m_record->ls_y;
-    const uint16_t btns  = m_record->buttons;
-    if (flags & 0x01) state.rightTrigger = rt;
-    if (flags & 0x02) state.leftTrigger  = l2;
-    if (flags & 0x04) state.rightThumbY  = rsy;
-    if (flags & 0x08) state.leftThumbY   = lsy;
-    if (flags & 0x10) state.buttons     |= btns;  // OR so user buttons still work
+    const uint8_t  flags = snap.flags;
+    if (flags & 0x01) state.rightTrigger = snap.rt;
+    if (flags & 0x02) state.leftTrigger  = snap.l2;
+    if (flags & 0x04) state.rightThumbY  = snap.rs_y;
+    if (flags & 0x08) state.leftThumbY   = snap.ls_y;
+    if (flags & 0x10) state.buttons     |= snap.buttons;  // OR so user buttons still work
+    if (flags & 0x20) state.rightThumbX  = snap.rs_x;
+    if (flags & 0x40) state.leftThumbX   = snap.ls_x;
 }
 
 } // namespace Labs

@@ -247,10 +247,21 @@ void ControllerMonitorWidget::paintEvent(QPaintEvent*)
     p.setPen(muted);
     p.drawText(QRect(16, 0, 240, hdrH), Qt::AlignVCenter, "CONTROLLER MONITOR");
 
-    const bool conn = m_hasState && m_state.connected;
+    // Status reflects PHYSICAL pad presence. XInput's 125Hz idle baseline
+    // (kind=None, connected=false) keeps InputOverride alive but must not
+    // light this header — that's the "shows ON when unplugged" bug.
+    const bool conn = m_hasState && m_state.connected
+                      && m_state.kind != ControllerKind::None;
+    const char* kindLabel =
+        (m_state.kind == ControllerKind::Xbox)        ? "XBOX" :
+        (m_state.kind == ControllerKind::PlayStation) ? "PLAYSTATION" :
+                                                        "NONE";
     QString statusStr = !m_hasState ? QStringLiteral("WAITING")
-                       : conn        ? QStringLiteral("SLOT %1  ●  CONNECTED").arg(m_state.slot)
-                                     : QStringLiteral("SLOT %1  ○  DISCONNECTED").arg(m_state.slot);
+                       : conn        ? QStringLiteral("%1  SLOT %2  ●  CONNECTED")
+                                          .arg(QLatin1String(kindLabel))
+                                          .arg(m_state.slot)
+                                     : QStringLiteral("%1  ○  DISCONNECTED")
+                                          .arg(QLatin1String(kindLabel));
     p.setPen(conn ? QColor(74, 222, 128) : muted);
     QFont stHead("Segoe UI Variable Text", 9, QFont::DemiBold);
     stHead.setLetterSpacing(QFont::AbsoluteSpacing, 1.0);

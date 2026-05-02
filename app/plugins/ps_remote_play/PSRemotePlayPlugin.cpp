@@ -1,11 +1,14 @@
 #include "PSRemotePlayPlugin.h"
 #include "PairPSDialog.h"
 #include "SettingsManager.h"
+#include "FrameBufferPool.h"
 
 #include <QByteArray>
 #include <QDateTime>
 #include <QDebug>
+#include <QMetaObject>
 #include <QMutexLocker>
+#include <QPointer>
 
 #include <cstring>
 #include <vector>
@@ -67,10 +70,19 @@ struct PSRemotePlayPlugin::Impl {
             case LABS_EVENT_CONNECTED:
                 qInfo() << "[PS] connected";
                 break;
-            case LABS_EVENT_QUIT:
+            case LABS_EVENT_QUIT: {
                 qWarning() << "[PS] quit:" << labs_quit_reason_string(event->quit.reason);
                 self->owner->m_running.store(false);
+                // Tear the chiaki session down on the owner thread, otherwise
+                // m_impl->sessionInited stays true and the next start() re-enters
+                // labs_session_init on an already-inited session.
+                QPointer<PSRemotePlayPlugin> ownerPtr = self->owner;
+                QMetaObject::invokeMethod(self->owner, [ownerPtr]() {
+                    if (!ownerPtr) return;
+                    ownerPtr->stop();
+                }, Qt::QueuedConnection);
                 break;
+            }
             default:
                 break;
         }
@@ -112,12 +124,18 @@ struct PSRemotePlayPlugin::Impl {
                                  SWS_LANCZOS, nullptr, nullptr, nullptr);
             bgraWidth  = w;
             bgraHeight = h;
-            bgraBuf.resize(size_t(w) * size_t(h) * 4);
             qInfo() << "[PS] stream resolution =" << w << "x" << h;
         }
         if (!sws) return;
 
-        uint8_t* dstData[4] = { bgraBuf.data(), nullptr, nullptr, nullptr };
+        // Acquire a pool slot and swscale directly into it. Replaces the
+        // old bgraBuf member + QByteArray copy path — saves two 8 MB
+        // memcpies per 1080p frame on the chiaki decode thread.
+        const size_t needed = size_t(w) * size_t(h) * 4;
+        auto slot = FrameBufferPool::global().acquire(needed);
+
+        uint8_t* dstData[4] = { reinterpret_cast<uint8_t*>(slot->data),
+                                nullptr, nullptr, nullptr };
         int      dstStride[4] = { w * 4, 0, 0, 0 };
         sws_scale(sws, src->data, src->linesize, 0, h, dstData, dstStride);
 
@@ -127,8 +145,9 @@ struct PSRemotePlayPlugin::Impl {
         f.stride = w * 4;
         f.format = PixelFormat::BGRA8;
         f.timestampUs = QDateTime::currentMSecsSinceEpoch() * 1000;
-        f.data = QByteArray(reinterpret_cast<const char*>(bgraBuf.data()),
-                            int(bgraBuf.size()));
+        f.sessionId = 1;   // see Frame.sessionId convention; preserves --session 1 for PS scripts
+        f.data = QByteArray::fromRawData(slot->data, int(needed));
+        f._pool_holder = slot;
 
         owner->m_frameCount.fetch_add(1, std::memory_order_relaxed);
         if (owner->m_sink) owner->m_sink->pushFrame(f);
@@ -166,7 +185,7 @@ struct PSRemotePlayPlugin::Impl {
         if (packet)   { av_packet_free(&packet); }
         if (codecCtx) { avcodec_free_context(&codecCtx); }
         codec = nullptr;
-        bgraBuf.clear(); bgraWidth = bgraHeight = 0;
+        bgraWidth = bgraHeight = 0;
     }
 };
 
@@ -197,9 +216,14 @@ bool PSRemotePlayPlugin::pair(QWidget* parent)
 bool PSRemotePlayPlugin::start()
 {
     if (m_running.load()) return true;
+    if (m_impl->sessionInited) {
+        qWarning() << "[PSRemotePlay] start() called while session still inited; refusing";
+        return false;
+    }
     if (!m_settings) { qWarning() << "PS: no settings"; return false; }
 
-    const QString host       = m_settings->value(QStringLiteral("ps/hostIp")).toString();
+    QString host = m_settings->value(QStringLiteral("ps/host")).toString();
+    if (host.isEmpty()) host = m_settings->value(QStringLiteral("ps/hostIp")).toString();
     const QByteArray registK = QByteArray::fromBase64(m_settings->value(QStringLiteral("ps/registKey")).toByteArray());
     const QByteArray morning = QByteArray::fromBase64(m_settings->value(QStringLiteral("ps/morning")).toByteArray());
     const bool    isPs5   = m_settings->value(QStringLiteral("ps/isPs5"), true).toBool();

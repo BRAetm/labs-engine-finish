@@ -3,10 +3,12 @@
 #include "IPlugin.h"
 #include "ShmBus.h"
 
+#include <QMutex>
 #include <QObject>
 #include <QPointer>
 #include <QProcess>
 #include <memory>
+#include <unordered_map>
 
 namespace Labs {
 
@@ -46,17 +48,31 @@ public:
     void stop()  override;
     bool isRunning() const override { return m_running; }
 
+public slots:
+    // Called by the engine when a session ends (e.g. xbox_stream's
+    // sessionRemoved signal). Closes that session's SHM writer so the
+    // block name is freed and a future session reusing the id won't
+    // inherit a stale event handle.
+    void closeSession(int sessionId);
+
 private:
-    void launchPython();
     void stopPython();
 
     SettingsManager* m_settings = nullptr;
-    FrameShmWriter   m_frameShm;
+    // Per-session SHM frame writers, keyed by Frame.sessionId. Opened lazily
+    // on first frame seen for each session; closed on closeSession or
+    // shutdown. Guarded by m_writersMx because pushFrame can be called from
+    // multiple capture threads (each xbox_stream session decodes on its own
+    // thread, plus PS Remote Play's chiaki decode thread).
+    QMutex m_writersMx;
+    // std::unordered_map (not QHash) because QHash requires copyable values
+    // and FrameShmWriter is held by unique_ptr (HANDLE ownership is move-only).
+    std::unordered_map<int, std::unique_ptr<FrameShmWriter>> m_frameShmBySession;
     std::unique_ptr<GamepadShmReader> m_gamepadReader;
     QPointer<QProcess> m_process;
     IControllerSink* m_ctrlSink = nullptr;
-    qint32 m_sessionId = 1;
     bool   m_running   = false;
+    bool   m_loggedFirstFrame = false;
 };
 
 } // namespace Labs

@@ -9,6 +9,8 @@ add_library(LabsCore SHARED
     SettingsManager.cpp
     InputOverride.h
     InputOverride.cpp
+    FrameBufferPool.h
+    FrameBufferPool.cpp
 )
 
 target_compile_definitions(LabsCore PRIVATE LABSCORE_EXPORTS)

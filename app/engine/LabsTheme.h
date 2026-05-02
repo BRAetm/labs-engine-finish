@@ -12,8 +12,8 @@ class SettingsManager;
 // Five user-editable color slots — same as LabsSharp's ThemeService, plus
 // optional background image.
 struct LabsThemeData {
-    QString preset   { "deepblue" };
-    QColor  bg       { "#070A14" };
+    QString preset   { "helios" };
+    QColor  bg       { "#101216" };
     QColor  bgSubtle { "#0B1020" };
     QColor  surface  { "#11182C" };
     QColor  accent   { "#3B82F6" };
@@ -35,9 +35,10 @@ struct LabsPreset {
     const char* text;
 };
 
-inline const std::array<LabsPreset, 4>& labsPresets()
+inline const std::array<LabsPreset, 5>& labsPresets()
 {
-    static const std::array<LabsPreset, 4> P = {{
+    static const std::array<LabsPreset, 5> P = {{
+        { "helios",   "helios",    "#101216", "#1C1F26", "#2A2F3A", "#00E5FF", "#F1F5F9" },
         { "deepblue", "deep blue", "#070A14", "#0B1020", "#11182C", "#3B82F6", "#F1F5F9" },
         { "midnight", "midnight",  "#0E0E1A", "#15162B", "#1B1C36", "#7C3AED", "#F5F3FF" },
         { "black",    "pure black","#000000", "#0A0A0A", "#141414", "#EAEAEA", "#FAFAFA" },

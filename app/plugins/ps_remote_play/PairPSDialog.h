@@ -2,6 +2,7 @@
 
 #include <QByteArray>
 #include <QDialog>
+#include <QPointer>
 #include <QString>
 #include <atomic>
 
@@ -64,9 +65,12 @@ private:
 
     QString m_accountIdBase64;
     QString m_psnUsername;
+    QString m_pairingHost; // captured on Pair click; safe to read from any thread
 
     struct Impl;
     Impl* m_impl = nullptr;
+    struct Holder; // heap-owned, lifetime extends past dialog destruction
+    Holder* m_holder = nullptr;
     std::atomic<bool> m_registRunning { false };
 };
 

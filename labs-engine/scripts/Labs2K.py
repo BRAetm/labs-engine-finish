@@ -15,6 +15,7 @@ import os
 import sys
 import time
 import threading
+import argparse
 from collections import deque
 from pathlib import Path
 
@@ -57,7 +58,7 @@ def _labs_engine_find(self):
         hits = []
         def _cb(hwnd, _):
             t = win32gui.GetWindowText(hwnd) or ""
-            if "Labs Engine" in t and win32gui.IsWindowVisible(hwnd):
+            if any(k in t for k in ("Labs Engine", "Xbox")) and win32gui.IsWindowVisible(hwnd):
                 r = win32gui.GetWindowRect(hwnd)
                 if (r[2] - r[0]) > 200 and (r[3] - r[1]) > 200:
                     hits.append((t, r))
@@ -84,8 +85,36 @@ def _labs_engine_find(self):
         print(f"[CAPTURE] win32gui error: {ex}", flush=True)
     return _orig_find(self)
 
-
 _eng.Engine._find_target_window = _labs_engine_find
+
+# ── SHM Video Capture Override ───────────────────────────────────────────────
+# If --labs-pid and --session are provided, completely bypass BetterCam and
+# instead read the zero-copy FFmpeg-decoded frames published by Labs Engine.
+import argparse
+parser = argparse.ArgumentParser(add_help=False)
+parser.add_argument("--labs-pid", type=int, default=0)
+parser.add_argument("--session", type=int, default=0)
+args, _ = parser.parse_known_args()
+
+if args.labs_pid > 0 and args.session > 0:
+    import labs_frame_bridge as _frame_io
+
+    class _ShmCameraWrapper:
+        def __init__(self, pid, session):
+            self.reader = _frame_io.ShmFrameReader(pid, session)
+        def start(self, **kwargs):
+            pass
+        def stop(self):
+            self.reader.close()
+        def get_latest_frame(self):
+            return self.reader.get_latest_frame()
+
+    def _start_shm_camera(self):
+        print(f"[CAPTURE] Bypassing BetterCam: using zero-copy SHM (PID {args.labs_pid}, Session {args.session})", flush=True)
+        self._camera = _ShmCameraWrapper(args.labs_pid, args.session)
+
+    _eng.Engine._start_camera = _start_shm_camera
+
 
 # Runtime correction: the RE'd source has REFRACTORY_SECONDS = 55.0, which is
 # almost certainly a misread of an F64 value — at 55s the engine only fires

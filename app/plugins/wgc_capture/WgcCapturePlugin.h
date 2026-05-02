@@ -25,6 +25,14 @@ public:
 
     IFrameSource* frameSource() override { return m_source.get(); }
 
+    // Cross-DLL accessors so LabsMainWindow can drive WGC capture without
+    // dynamic_cast'ing the IFrameSource pointer (which is unsafe across
+    // plugin boundaries). Used to retarget WGC at the Xbox WebView2 HWND
+    // when the user switches into Xbox mode.
+    Q_INVOKABLE void setTargetByHwnd(quintptr hwnd, const QString& label);
+    Q_INVOKABLE bool startCapture();
+    Q_INVOKABLE void stopCapture();
+
 private:
     std::unique_ptr<WgcSource> m_source;
 };

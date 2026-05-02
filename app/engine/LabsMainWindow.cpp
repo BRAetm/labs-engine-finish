@@ -2,7 +2,9 @@
 #include "ControllerMonitorWidget.h"
 #include "LabsBackgroundWidget.h"
 #include "LabsLogoWidget.h"
+#include "LabsPaths.h"
 #include "LabsTheme.h"
+#include "MarketplaceWidget.h"
 #include "LabsThemeDialog.h"
 #include "Ps5Discovery.h"
 
@@ -10,10 +12,28 @@
 #include "InputOverride.h"
 #include "PluginHost.h"
 #include "SettingsManager.h"
+// XboxStreamPlugin and XboxStreamSession live in a plugin DLL the engine
+// doesn't link against. All cross-boundary access goes through Qt's meta
+// system (QMetaObject::invokeMethod, string-form connect) and dynamic_cast
+// to the core IFrameSource / IControllerSink interfaces (which DO live in
+// LabsCore.lib that both engine and plugin link against).
 
+// Win32 reparenting for embedding the Electron sidecar's BrowserWindow inside
+// the Labs Engine main window.
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <QResizeEvent>
+#include <QShowEvent>
+
+#include <QAction>
 #include <QApplication>
 #include <QByteArray>
 #include <QCloseEvent>
+#include <QDialog>
+#include <QEvent>
+#include <QFrame>
+#include <QMenu>
+#include <QMouseEvent>
 #include <QComboBox>
 #include <QCoreApplication>
 #include <QDesktopServices>
@@ -22,6 +42,11 @@
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QFrame>
+#include <QGroupBox>
+#include <QIcon>
+#include <QScrollArea>
+#include <QSize>
+#include <QTabWidget>
 #include <QHBoxLayout>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -40,17 +65,107 @@
 #include <QVBoxLayout>
 #include <QWidget>
 
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <optional>
+#include <thread>
+
 namespace Labs {
 
-// Frame-sink fan-out so one source can feed multiple sinks (display + CV).
+// Frame-sink fan-out — two lanes:
+//   - realtime: pushed synchronously on the source thread. Cheap because
+//               the realtime sinks (DisplayPlugin) immediately enqueue to
+//               the GUI thread via QMetaObject::invokeMethod.
+//   - async:    a single dedicated worker thread with a 1-slot drop-oldest
+//               queue. CvPython's SHM write can stall (paging, slow CV
+//               consumer) and we DON'T want that to backpressure the
+//               capture rate. Newer frames overwrite the unsent one in
+//               the queue — CV consumers see the freshest frame, never
+//               a backlog.
+//
+// Frame's _pool_holder shared_ptr keeps the FrameBufferPool slot reserved
+// for the async sink while the realtime sink is also using it; the slot
+// returns to the pool only once the LAST consumer drops the Frame.
 class LabsMainWindow::FanOutFrameSink : public IFrameSink {
 public:
-    void addSink(IFrameSink* s) { if (s) m_sinks.push_back(s); }
-    void pushFrame(const Frame& frame) override {
-        for (auto* s : m_sinks) s->pushFrame(frame);
+    FanOutFrameSink() = default;
+    ~FanOutFrameSink() {
+        {
+            std::lock_guard<std::mutex> lk(m_mx);
+            m_running = false;
+            m_pending.reset();
+        }
+        m_cv.notify_all();
+        if (m_worker.joinable()) m_worker.join();
     }
+
+    // Default registration is realtime — back-compat with existing call sites.
+    void addSink(IFrameSink* s) {
+        if (!s) return;
+        std::lock_guard<std::mutex> lk(m_mx);
+        m_realtime.push_back(s);
+    }
+    // Async registration — sink runs on the worker thread, off the source
+    // critical path. Use for slow / blocking sinks (CvPython SHM).
+    void addAsyncSink(IFrameSink* s) {
+        if (!s) return;
+        std::lock_guard<std::mutex> lk(m_mx);
+        m_async.push_back(s);
+    }
+
+    // Deferred worker start: keep the worker thread off until plugin
+    // registration is complete, otherwise asyncLoop races addAsyncSink.
+    void startWorker() {
+        if (m_running.exchange(true)) return;
+        m_worker = std::thread([this]{ asyncLoop(); });
+    }
+
+    void pushFrame(const Frame& frame) override {
+        // Snapshot under the lock so we don't read while addSink is mutating
+        // the vectors. Copying pointer vectors is cheap.
+        std::vector<IFrameSink*> realtime;
+        bool haveAsync = false;
+        {
+            std::lock_guard<std::mutex> lk(m_mx);
+            realtime = m_realtime;
+            haveAsync = !m_async.empty();
+            if (haveAsync) {
+                m_pending = frame;       // shared_ptr / QByteArray refs bumped
+            }
+        }
+        // Realtime lane — synchronous on the source thread (outside lock).
+        for (auto* s : realtime) s->pushFrame(frame);
+
+        // Async lane — drop-oldest. Replace whatever's pending so the
+        // worker always picks up the freshest frame.
+        if (haveAsync) m_cv.notify_one();
+    }
+
 private:
-    std::vector<IFrameSink*> m_sinks;
+    void asyncLoop() {
+        while (true) {
+            Frame f;
+            std::vector<IFrameSink*> async;
+            {
+                std::unique_lock<std::mutex> lk(m_mx);
+                m_cv.wait(lk, [this]{ return !m_running || m_pending.has_value(); });
+                if (!m_running) return;
+                f = std::move(*m_pending);
+                m_pending.reset();
+                async = m_async;
+            }
+            for (auto* s : async) s->pushFrame(f);
+        }
+    }
+
+    std::vector<IFrameSink*>  m_realtime;
+    std::vector<IFrameSink*>  m_async;
+    std::thread               m_worker;
+    std::mutex                m_mx;
+    std::condition_variable   m_cv;
+    std::optional<Frame>      m_pending;
+    std::atomic<bool>         m_running{false};
 };
 
 // Simple controller fan-out with one always-on monitor slot and a swappable
@@ -165,12 +280,13 @@ static bool isLanIp(const QString& ip)
 
 // Canonical user scripts folder. Auto-scanned on startup, also where downloaded
 // scripts land. User can drop their own .py files in here and they show up.
+//
+// Wraps Labs::Paths::userScriptsDir() so the engine, launcher, marketplace,
+// and future Zen Coder all share a single canonical location independent
+// of each binary's per-app AppData. See app/core/LabsPaths.h.
 static QString userScriptsDir()
 {
-    const QString appData = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
-    const QString dir = QDir::cleanPath(appData + QStringLiteral("/scripts"));
-    QDir().mkpath(dir);
-    return dir;
+    return Labs::Paths::userScriptsDir();
 }
 
 // On first launch, copy any bundled .py scripts into the user folder so the app
@@ -207,6 +323,19 @@ static void seedDefaultScripts()
                 if (!QFile::exists(dst)) QFile::copy(fi.absoluteFilePath(), dst);
             }
         }
+        
+        // Also copy zp_core/ into the user's scripts folder
+        const QString zpSrc = QDir::cleanPath(src + QStringLiteral("/zp_core"));
+        const QString zpDst = QDir::cleanPath(userDir + QStringLiteral("/zp_core"));
+        if (QDir(zpSrc).exists()) {
+            QDir().mkpath(zpDst);
+            for (const QFileInfo& fi : QDir(zpSrc).entryInfoList(
+                     QStringList{QStringLiteral("*.py")}, QDir::Files)) {
+                const QString dst = zpDst + QChar('/') + fi.fileName();
+                if (!QFile::exists(dst)) QFile::copy(fi.absoluteFilePath(), dst);
+            }
+        }
+        
         break;  // first matching source dir wins
     }
 }
@@ -302,8 +431,16 @@ LabsMainWindow::LabsMainWindow(QWidget* parent)
         m_pluginsByName.insert(p->name(), p);
         if (auto* sp = dynamic_cast<IFrameSourcePlugin*>(p); sp)
             m_frameSources.insert(p->name(), sp->frameSource());
-        if (auto* kp = dynamic_cast<IFrameSinkPlugin*>(p); kp)
-            m_fanOut->addSink(kp->frameSink());
+        if (auto* kp = dynamic_cast<IFrameSinkPlugin*>(p); kp) {
+            // CvPython publishes to a SHM block that can stall (paging,
+            // slow CV consumer) — route it through the async lane so a
+            // stuck SHM write doesn't backpressure capture / display.
+            if (p->name() == QStringLiteral("CV Python")) {
+                m_fanOut->addAsyncSink(kp->frameSink());
+            } else {
+                m_fanOut->addSink(kp->frameSink());
+            }
+        }
         if (auto* sp = dynamic_cast<IControllerSourcePlugin*>(p); sp) {
             if      (p->name() == QStringLiteral("CV Python")) cvCtrlSource    = sp->controllerSource();
             else if (p->name() == QStringLiteral("XInput"))    xinputCtrlSource = sp->controllerSource();
@@ -316,20 +453,61 @@ LabsMainWindow::LabsMainWindow(QWidget* parent)
         if (auto* kp = dynamic_cast<IControllerSinkPlugin*>(p); kp)
             m_ctrlSinks.insert(p->name(), kp->controllerSink());
 
-        // Mount the first UIPlugin into the center stage.
-        if (auto* ui = dynamic_cast<IUIPlugin*>(p); ui && m_stageHost && m_stageHost->layout()->count() == 0) {
+        // Mount every IUIPlugin into the center stage. applyMode() shows
+        // the one matching the current mode and hides the rest. We need
+        // BOTH the Display surface (PS mode + Xbox Stream sidecar) AND
+        // the Xbox Web (WebView2 → xbox.com/play) widget mounted, then
+        // switch visibility per mode.
+        if (auto* ui = dynamic_cast<IUIPlugin*>(p); ui && m_stageHost) {
             QWidget* w = ui->createWidget(m_stageHost);
-            m_stageHost->layout()->addWidget(w);
+            if (w) {
+                w->setProperty("uiPluginName", p->name());
+                // Stretch the UI plugin widget so it fills the stage area
+                // (esp. WebView2 — without stretch it collapses to its size hint).
+                if (auto* vbox = qobject_cast<QVBoxLayout*>(m_stageHost->layout())) {
+                    vbox->addWidget(w, 1);
+                } else {
+                    m_stageHost->layout()->addWidget(w);
+                }
+                w->setVisible(false);  // applyMode() reveals the right one
+            }
         }
     }
 
-    m_ctrlSource = cvCtrlSource ? cvCtrlSource : xinputCtrlSource;
+    // All plugin sinks have registered — safe to start the async worker now.
+    // Starting it earlier would race addAsyncSink / addSink mutations.
+    if (m_fanOut) m_fanOut->startWorker();
+
+    // Cross-DLL queued signals carrying quintptr need explicit metatype
+    // registration on the engine side (the plugin's MOC registered it on the
+    // plugin side; both sides need it for marshaling to succeed).
+    qRegisterMetaType<quintptr>("quintptr");
+
+    // XboxStream is a session factory now (multi-session). Hook its signals so
+    // we can route the focused session's IFrameSource into m_activeSource and
+    // its IControllerSink into m_activeCtrlSink.
+    hookXboxStreamSignals();
+    hookXboxWebSignals();
+
+    // Always run XInput. It feeds the controller monitor with live physical-pad
+    // state at 125Hz and (with idleEmit on) keeps a heartbeat going so the ViGEm
+    // virtual pad looks "alive" to xbox.com/play even when no script is running.
+    // CV Python's controller-source path is legacy (current scripts use the
+    // InputOverride SHM bridge instead); only use it if XInput isn't loaded.
+    m_ctrlSource = xinputCtrlSource ? xinputCtrlSource : cvCtrlSource;
 
     // Single controller source pipe: primary source → fan-out → [monitor, mode output].
     s_ctrlFanOut.setMonitor(m_monitor);
     if (m_ctrlSource) {
         m_ctrlSource->setSink(&s_ctrlFanOut);
         m_ctrlSource->start();
+    }
+    // CvPython is also a frame-sink: when started, it publishes every fan-out
+    // frame to the Labs_<pid>_Frame_<sessionId> SHM block so external scripts
+    // can read decoded pixels directly. Even when XInput is the primary
+    // controller source, we need CvPython running for that frame pipe.
+    if (cvCtrlSource && cvCtrlSource != m_ctrlSource) {
+        cvCtrlSource->start();
     }
     // DualSense runs in parallel so PS pads work even when ViGEmBus is absent.
     // It pushes into the same fan-out as the primary source; the XInputSource
@@ -341,7 +519,7 @@ LabsMainWindow::LabsMainWindow(QWidget* parent)
     }
 
     const int savedMode = m_settings->value(QStringLiteral("session/mode"), 0).toInt();
-    m_modeBox->setCurrentIndex(qBound(0, savedMode, 1));
+    m_modeBox->setCurrentIndex(qBound(0, savedMode, 2));
     applyMode(static_cast<Mode>(m_modeBox->currentIndex()));
 
     connect(m_modeBox, QOverload<int>::of(&QComboBox::currentIndexChanged),
@@ -398,13 +576,58 @@ void LabsMainWindow::applyThemeImage()
 
 LabsMainWindow::~LabsMainWindow()
 {
+    // ORDER MATTERS — see fix audit for crash-on-shutdown.
+    //
+    // 1) Stop every controller source thread BEFORE we let any child widget
+    //    die. The sources push into s_ctrlFanOut on their own threads and
+    //    s_ctrlFanOut holds raw pointers to m_monitor and m_activeCtrlSink
+    //    (child widgets / plugin sinks). If a thread fires pushState after
+    //    those have been destroyed we get a UAF (0xc0000409 stack-overrun).
+    //
+    //    NOTE: IControllerSource::stop() must be SYNCHRONOUS — it must join
+    //    its internal thread before returning. All current implementations
+    //    (XInputSource, DualSensePlugin, CvPythonPlugin) honor that. If a
+    //    future plugin makes stop() async, add an explicit join/wait here.
     stopActiveSource();
     if (m_ctrlSource) m_ctrlSource->stop();
     if (m_dualSenseSource && m_dualSenseSource != m_ctrlSource) m_dualSenseSource->stop();
+    // m_xinputSource is normally the same pointer as m_ctrlSource; only stop
+    // it if it's somehow distinct (defensive — covers a hypothetical future
+    // where the monitor source diverges from the primary).
+    if (m_xinputSource && m_xinputSource != m_ctrlSource &&
+        m_xinputSource != m_dualSenseSource) {
+        m_xinputSource->stop();
+    }
+    // Any other IControllerSource the plugin layer surfaced (e.g. CV Python
+    // started as the secondary frame-pipe at ctor) — stop them via the
+    // plugin shutdown path. We iterate live plugins so we don't have to
+    // track every source as a member.
+    for (IPlugin* p : m_pluginsByName) {
+        if (auto* sp = dynamic_cast<IControllerSourcePlugin*>(p)) {
+            if (auto* cs = sp->controllerSource()) {
+                if (cs != m_ctrlSource && cs != m_dualSenseSource &&
+                    cs != m_xinputSource) {
+                    cs->stop();
+                }
+            }
+        }
+    }
+
+    // 2) Null out the static fan-out's pointers so any racing pushState
+    //    that slipped through stop() (shouldn't, but cheap insurance) is
+    //    a no-op instead of a deref into freed widget memory.
+    s_ctrlFanOut.setMonitor(nullptr);
+    s_ctrlFanOut.setOutput(nullptr);
+
     if (m_scriptProc && m_scriptProc->state() != QProcess::NotRunning) {
         m_scriptProc->terminate();
         m_scriptProc->waitForFinished(1000);
     }
+
+    // 3) Now Qt can safely destroy child widgets, then unique_ptr members
+    //    destruct in reverse declaration order: m_fanOut (joins its worker
+    //    thread), then m_pluginHost (calls IPlugin::shutdown + DLL unload),
+    //    then m_settings.
 }
 
 void LabsMainWindow::closeEvent(QCloseEvent* event)
@@ -453,22 +676,138 @@ QWidget* LabsMainWindow::buildTopBar()
     m_statePill->setAlignment(Qt::AlignCenter);
     m_statePill->setVisible(false);
 
-    auto* modeLabel = new QLabel(QStringLiteral("mode"), bar);
+    // Active-session switcher (hidden when nothing is running). Stays in the
+    // top bar but only surfaces once you've started something.
+    auto* modeLabel = new QLabel(QStringLiteral("active"), bar);
     modeLabel->setObjectName(QStringLiteral("modeLabel"));
 
     m_modeBox = new QComboBox(bar);
-    m_modeBox->addItem(QStringLiteral("Xbox (WGC)"));
+    // Dropdown index → Mode enum (must stay in sync with enum values in .h).
+    // Used only as the *type* of the active session — entries are populated
+    // dynamically once sessions exist. Pre-populate with the kinds so the
+    // legacy applyMode() switch keeps compiling; hidden until session count > 0.
+    m_modeBox->addItem(QStringLiteral("Xbox Remote Play"));
     m_modeBox->addItem(QStringLiteral("PS Remote Play"));
-    m_modeBox->setMinimumWidth(170);
+    m_modeBox->addItem(QStringLiteral("xCloud"));
+    m_modeBox->setMinimumWidth(190);
+    modeLabel->setVisible(false);
+    m_modeBox->setVisible(false);
 
-    m_btnPick  = new QPushButton(QStringLiteral("pick window"), bar);
-    m_btnPair  = new QPushButton(QStringLiteral("pair…"),       bar);
+    // ── primary action: + new session ─────────────────────────────────────
+    auto* btnNewSession = new QPushButton(QStringLiteral("+ new session"), bar);
+    btnNewSession->setProperty("accent", true);
+    btnNewSession->setMinimumHeight(34);
+    // Hidden actions wired below; the button triggers a Labs-themed modal
+    // dialog with 4 cards which then triggers the right action.
+    QAction* aCap   = new QAction(this);
+    QAction* aPs    = new QAction(this);
+    QAction* aXboxR = new QAction(this);
+    QAction* aCloud = new QAction(this);
+    connect(btnNewSession, &QPushButton::clicked, this, [this, aCap, aPs, aXboxR, aCloud]() {
+        QDialog dlg(this);
+        dlg.setWindowTitle(QStringLiteral("New session"));
+        dlg.setStyleSheet(QStringLiteral(
+            "QDialog{background:#070A14;}"
+            "QFrame#card{background:#11182C;border:1px solid #1E2A4A;border-radius:6px;}"
+            "QFrame#card:hover{border-color:#3B82F6;background:#182142;}"
+            "QLabel#cardTitle{color:#F1F5F9;font-family:'Segoe UI Variable Display','Segoe UI';"
+                "font-size:16px;font-weight:600;}"
+            "QLabel#cardDesc{color:#94A3B8;font-family:'Segoe UI Variable Text','Segoe UI';"
+                "font-size:12px;}"
+            "QLabel#cardIcon{color:#60A5FA;font-size:34px;}"
+            "QLabel#hdr{color:#F1F5F9;font-family:'Segoe UI Variable Display','Segoe UI';"
+                "font-size:22px;font-weight:600;}"
+        ));
+        dlg.setMinimumSize(720, 360);
+        auto* col = new QVBoxLayout(&dlg);
+        col->setContentsMargins(28, 22, 28, 22);
+        col->setSpacing(18);
+        auto* hdr = new QLabel(QStringLiteral("Start a new session"), &dlg);
+        hdr->setObjectName(QStringLiteral("hdr"));
+        col->addWidget(hdr);
+        auto* sub = new QLabel(QStringLiteral("Pick a source. You can start more after this — up to 8 at once."), &dlg);
+        sub->setStyleSheet(QStringLiteral("color:#94A3B8;font-size:12px;"));
+        col->addWidget(sub);
+        auto* grid = new QHBoxLayout();
+        grid->setSpacing(14);
+        col->addLayout(grid, 1);
+
+        auto makeCard = [&](const QString& icon, const QString& title, const QString& desc, QAction* action) {
+            auto* card = new QFrame(&dlg);
+            card->setObjectName(QStringLiteral("card"));
+            card->setCursor(Qt::PointingHandCursor);
+            card->setMinimumSize(160, 200);
+            auto* cv = new QVBoxLayout(card);
+            cv->setContentsMargins(18, 22, 18, 22);
+            cv->setSpacing(10);
+            auto* iconL = new QLabel(icon, card);
+            iconL->setObjectName(QStringLiteral("cardIcon"));
+            iconL->setAlignment(Qt::AlignCenter);
+            cv->addWidget(iconL);
+            auto* titleL = new QLabel(title, card);
+            titleL->setObjectName(QStringLiteral("cardTitle"));
+            titleL->setAlignment(Qt::AlignCenter);
+            cv->addWidget(titleL);
+            auto* descL = new QLabel(desc, card);
+            descL->setObjectName(QStringLiteral("cardDesc"));
+            descL->setWordWrap(true);
+            descL->setAlignment(Qt::AlignCenter);
+            cv->addWidget(descL, 1);
+            // Click-to-trigger via event filter — QFrame doesn't have click signal.
+            card->installEventFilter(&dlg);
+            QObject::connect(&dlg, &QObject::destroyed, action, [](){});  // no-op tie
+            // Use a captured raw pointer dance: associate the action with the card via dynamic property.
+            card->setProperty("triggerAction", QVariant::fromValue<void*>(action));
+            grid->addWidget(card, 1);
+        };
+        // Custom event filter to handle clicks on cards and dispatch.
+        struct CardClickFilter : public QObject {
+            QDialog* dlg;
+            CardClickFilter(QDialog* d) : QObject(d), dlg(d) {}
+            bool eventFilter(QObject* o, QEvent* e) override {
+                if (e->type() == QEvent::MouseButtonRelease) {
+                    auto* card = qobject_cast<QFrame*>(o);
+                    if (card) {
+                        auto* a = static_cast<QAction*>(card->property("triggerAction").value<void*>());
+                        if (a) {
+                            dlg->accept();
+                            QMetaObject::invokeMethod(a, "trigger", Qt::QueuedConnection);
+                        }
+                    }
+                }
+                return QObject::eventFilter(o, e);
+            }
+        };
+        auto* filter = new CardClickFilter(&dlg);
+        // Re-install filter on each card after creation.
+        // (Cards already have installEventFilter(&dlg) — replace with our filter.)
+        // Simpler: walk the children after building.
+        makeCard(QStringLiteral("📺"), QStringLiteral("Capture Card"),
+                 QStringLiteral("HDMI in from any console — best for CV scripts."), aCap);
+        makeCard(QStringLiteral("🔵"), QStringLiteral("PS Remote Play"),
+                 QStringLiteral("Stream from your PS5 over the network."), aPs);
+        makeCard(QStringLiteral("🟢"), QStringLiteral("Xbox Remote Play"),
+                 QStringLiteral("Stream from your Xbox console."), aXboxR);
+        makeCard(QStringLiteral("☁️"), QStringLiteral("xCloud"),
+                 QStringLiteral("Browser-based, sign in directly on xbox.com/play."), aCloud);
+        // Re-install our filter on the cards (replacing the placeholder).
+        for (auto* card : dlg.findChildren<QFrame*>(QStringLiteral("card"))) {
+            card->removeEventFilter(&dlg);
+            card->installEventFilter(filter);
+        }
+        dlg.exec();
+    });
+
+    // Keep m_btnPair as a hidden no-op so existing code paths that reference
+    // it stay valid until the next refactor pass.
+    m_btnPair = new QPushButton(QString(), bar);
+    m_btnPair->setVisible(false);
+
     auto* btnTheme = new QPushButton(QStringLiteral("theme…"),  bar);
+    btnTheme ->setProperty("ghost",  true);
+
     m_btnStart = new QPushButton(QStringLiteral("START ENGINE"), bar);
     m_btnStop  = new QPushButton(QStringLiteral("STOP"),         bar);
-    m_btnPick->setProperty("ghost",  true);
-    m_btnPair->setProperty("ghost",  true);
-    btnTheme ->setProperty("ghost",  true);
     m_btnStart->setProperty("accent", true);
     m_btnStop ->setProperty("danger", true);
     m_btnStop->setVisible(false);  // only show when running
@@ -499,9 +838,64 @@ QWidget* LabsMainWindow::buildTopBar()
         if (m_settings) { m_settings->setValue(QStringLiteral("cv/perfMode"), "high"); m_settings->sync(); }
     });
 
-    connect(m_btnPick,  &QPushButton::clicked, this, &LabsMainWindow::onPickWindow);
-    connect(m_btnPair,  &QPushButton::clicked, this, &LabsMainWindow::onPair);
-    connect(btnTheme,   &QPushButton::clicked, this, &LabsMainWindow::onOpenTheme);
+    connect(btnTheme, &QPushButton::clicked, this, &LabsMainWindow::onOpenTheme);
+
+    // + new session → menu actions. Each action sets the mode (so applyMode +
+    // pair() route correctly) and triggers the corresponding flow.
+    auto setModeAndPair = [this](Mode m) {
+        if (m_modeBox) m_modeBox->setCurrentIndex(static_cast<int>(m));
+        applyMode(m);
+        // Persist xbox/mode so XboxStreamPlugin::pair sees the right value.
+        if (m_settings) {
+            const QString modeStr = (m == Mode::Cloud) ? QStringLiteral("cloud")
+                                  : (m == Mode::Xbox)  ? QStringLiteral("home")
+                                                       : QString();
+            if (!modeStr.isEmpty()) {
+                m_settings->setValue(QStringLiteral("xbox/mode"), modeStr);
+                m_settings->sync();
+            }
+        }
+        const QString pluginName =
+              m == Mode::PS    ? QStringLiteral("PS Remote Play")
+            : m == Mode::Cloud ? QStringLiteral("Xbox Web")     // visible WebView2 → xbox.com/play
+            : m == Mode::Xbox  ? QStringLiteral("Xbox Stream")  // headless Greenlight Remote Play
+                               : QString();
+        if (pluginName.isEmpty()) return;
+        IPlugin* p = m_pluginsByName.value(pluginName, nullptr);
+        if (auto* pr = dynamic_cast<IPairablePlugin*>(p)) {
+            pr->pair(this);
+        }
+    };
+
+    connect(aCap, &QAction::triggered, this, [this]() {
+        IPlugin* p = m_pluginsByName.value(QStringLiteral("Capture Card"), nullptr);
+        if (!p) { appendLog(QStringLiteral("Capture Card plugin not loaded")); return; }
+        auto* pr = dynamic_cast<IPairablePlugin*>(p);
+        if (!pr || !pr->pair(this)) return;
+
+        stopActiveSource();
+        if (IPlugin* wgc = m_pluginsByName.value(QStringLiteral("WGC Capture"), nullptr)) {
+            QMetaObject::invokeMethod(wgc->qobject(), "stopCapture", Qt::DirectConnection);
+        }
+        IFrameSource* src = m_frameSources.value(QStringLiteral("Capture Card"), nullptr);
+        if (!src) { appendLog(QStringLiteral("Capture Card source missing")); return; }
+        src->setSink(m_fanOut.get());
+        m_activeSource = src;
+        if (src->start()) {
+            m_lastFrameCount = src->frameCount();
+            m_fpsTimer->start();
+            if (m_targetLabel) m_targetLabel->setText(src->targetLabel());
+            m_scriptStatus->setText(QStringLiteral("running"));
+            appendLog(QStringLiteral("Capture card started — %1").arg(src->targetLabel()));
+            updateActions();
+        } else {
+            appendLog(QStringLiteral("Capture card start failed"));
+        }
+    });
+    connect(aPs,    &QAction::triggered, this, [setModeAndPair]() { setModeAndPair(Mode::PS); });
+    connect(aXboxR, &QAction::triggered, this, [setModeAndPair]() { setModeAndPair(Mode::Xbox); });
+    connect(aCloud, &QAction::triggered, this, [setModeAndPair]() { setModeAndPair(Mode::Cloud); });
+
     connect(m_btnStart, &QPushButton::clicked, this, &LabsMainWindow::onStart);
     connect(m_btnStop,  &QPushButton::clicked, this, &LabsMainWindow::onStop);
 
@@ -516,8 +910,7 @@ QWidget* LabsMainWindow::buildTopBar()
     row->addStretch();
     row->addWidget(modeLabel);
     row->addWidget(m_modeBox);
-    row->addWidget(m_btnPick);
-    row->addWidget(m_btnPair);
+    row->addWidget(btnNewSession);
     row->addWidget(btnTheme);
     row->addSpacing(8);
     // perf segmented control sits right before Start/Stop so it reads as the choice
@@ -542,15 +935,31 @@ QWidget* LabsMainWindow::buildScriptsRail()
     rail->setFixedWidth(270);
 
     auto* col = new QVBoxLayout(rail);
-    col->setContentsMargins(22, 22, 22, 22);
-    col->setSpacing(0);
+    col->setContentsMargins(14, 16, 14, 16);
+    col->setSpacing(16);
 
-    col->addWidget(sectionLabel(QStringLiteral("scripts"), rail));
-    col->addSpacing(14);
+    // Panel: CV Python
+    auto* panel = new QFrame(rail);
+    panel->setObjectName(QStringLiteral("panel"));
+    auto* panelL = new QVBoxLayout(panel);
+    panelL->setContentsMargins(0, 0, 0, 0);
+    panelL->setSpacing(0);
+    auto* header = new QFrame(panel);
+    header->setObjectName(QStringLiteral("panelHeader"));
+    auto* headerL = new QHBoxLayout(header);
+    headerL->setContentsMargins(12, 8, 12, 8);
+    headerL->addWidget(sectionLabel(QStringLiteral("CV Python"), header));
+    auto* content = new QWidget(panel);
+    auto* contentL = new QVBoxLayout(content);
+    contentL->setContentsMargins(12, 12, 12, 12);
+    contentL->setSpacing(8);
+    panelL->addWidget(header);
+    panelL->addWidget(content);
+    col->addWidget(panel);
 
-    auto* eb = eyebrowLabel(QStringLiteral("active script"), rail);
-    col->addWidget(eb);
-    col->addSpacing(4);
+    auto* eb = eyebrowLabel(QStringLiteral("active script"), content);
+    contentL->addWidget(eb);
+    contentL->addSpacing(4);
 
     m_scriptCombo = new QComboBox(rail);
     m_scriptCombo->setEditable(false);
@@ -585,50 +994,50 @@ QWidget* LabsMainWindow::buildScriptsRail()
     }
     connect(m_scriptCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
             this, [this](int) { updateActions(); });
-    col->addWidget(m_scriptCombo);
+    contentL->addWidget(m_scriptCombo);
 
-    col->addSpacing(8);
+    contentL->addSpacing(8);
     auto* scriptToolRow = new QHBoxLayout();
     scriptToolRow->setSpacing(6);
-    m_scriptBrowseBtn = new QPushButton(QStringLiteral("browse…"), rail);
+    m_scriptBrowseBtn = new QPushButton(QStringLiteral("browse…"), content);
     m_scriptBrowseBtn->setProperty("ghost", true);
-    auto* openFolderBtn = new QPushButton(QStringLiteral("open folder"), rail);
+    auto* openFolderBtn = new QPushButton(QStringLiteral("open folder"), content);
     openFolderBtn->setProperty("ghost", true);
+    auto* refreshBtn = new QPushButton(QStringLiteral("refresh"), content);
+    refreshBtn->setProperty("ghost", true);
+    refreshBtn->setToolTip(QStringLiteral("Re-scan scripts folder for new .py files"));
     connect(m_scriptBrowseBtn, &QPushButton::clicked, this, &LabsMainWindow::onBrowseScript);
     connect(openFolderBtn, &QPushButton::clicked, this, []() {
         QDesktopServices::openUrl(QUrl::fromLocalFile(userScriptsDir()));
     });
+    connect(refreshBtn, &QPushButton::clicked, this, &LabsMainWindow::onRefreshScripts);
     scriptToolRow->addWidget(m_scriptBrowseBtn);
     scriptToolRow->addWidget(openFolderBtn);
-    col->addLayout(scriptToolRow);
+    scriptToolRow->addWidget(refreshBtn);
+    contentL->addLayout(scriptToolRow);
 
-    col->addSpacing(6);
-    auto* hint = new QLabel(
-        QStringLiteral("Drop .py files in the scripts folder to add them. They'll show up in the picker on next launch."),
-        rail);
-    hint->setObjectName(QStringLiteral("eyebrow"));
-    hint->setWordWrap(true);
-    hint->setStyleSheet(QStringLiteral("padding: 0; letter-spacing: 0.2px; font-weight: 400;"));
-    col->addWidget(hint);
-
-    col->addSpacing(14);
-    m_scriptRunBtn  = new QPushButton(QStringLiteral("RUN SCRIPT"), rail);
-    m_scriptStopBtn = new QPushButton(QStringLiteral("STOP"), rail);
+    contentL->addSpacing(14);
+    contentL->addWidget(eyebrowLabel(QStringLiteral("Control"), content));
+    contentL->addSpacing(4);
+    m_scriptRunBtn  = new QPushButton(QStringLiteral("Start"), content);
+    m_scriptStopBtn = new QPushButton(QStringLiteral("Restart"), content);
     m_scriptStopBtn->setEnabled(false);
     m_scriptRunBtn ->setProperty("accent", true);
-    m_scriptStopBtn->setProperty("danger", true);
-    m_scriptStopBtn->setVisible(false);
+    m_scriptStopBtn->setProperty("ghost", true); // Restart button isn't primary danger in screenshot
     connect(m_scriptRunBtn,  &QPushButton::clicked, this, &LabsMainWindow::onRunScript);
     connect(m_scriptStopBtn, &QPushButton::clicked, this, &LabsMainWindow::onStopScript);
-    col->addWidget(m_scriptRunBtn);
-    col->addWidget(m_scriptStopBtn);
+    
+    auto* ctrlRow = new QHBoxLayout();
+    ctrlRow->addWidget(m_scriptRunBtn);
+    ctrlRow->addWidget(m_scriptStopBtn);
+    contentL->addLayout(ctrlRow);
 
-    col->addSpacing(20);
-    col->addWidget(eyebrowLabel(QStringLiteral("status"), rail));
-    col->addSpacing(4);
-    m_scriptStatus = new QLabel(QStringLiteral("idle"), rail);
+    contentL->addSpacing(20);
+    contentL->addWidget(eyebrowLabel(QStringLiteral("status"), content));
+    contentL->addSpacing(4);
+    m_scriptStatus = new QLabel(QStringLiteral("idle"), content);
     m_scriptStatus->setObjectName(QStringLiteral("statusMono"));
-    col->addWidget(m_scriptStatus);
+    contentL->addWidget(m_scriptStatus);
 
     col->addStretch();
     col->addWidget(hSeparator(rail));
@@ -665,6 +1074,15 @@ QWidget* LabsMainWindow::buildCenterStage()
     m_tabMonitor->setCursor(Qt::PointingHandCursor);
     m_tabMonitor->installEventFilter(this);
 
+    // Marketplace tab — same widget the launcher embeds, third tab so users
+    // can install scripts without bouncing back to the hub. Both surfaces
+    // read/write the same canonical %LocalAppData%\Labs\scripts folder, so
+    // anything installed here shows up in the launcher immediately.
+    m_tabMarket = new QLabel(QStringLiteral("marketplace"), tabs);
+    m_tabMarket->setObjectName(QStringLiteral("tabInactive"));
+    m_tabMarket->setCursor(Qt::PointingHandCursor);
+    m_tabMarket->installEventFilter(this);
+
     m_targetLabel = new QLabel(QStringLiteral(""), tabs);
     m_targetLabel->setObjectName(QStringLiteral("targetText"));
 
@@ -676,6 +1094,7 @@ QWidget* LabsMainWindow::buildCenterStage()
     tabsRow->setSpacing(0);
     tabsRow->addWidget(m_tabVideo);
     tabsRow->addWidget(m_tabMonitor);
+    tabsRow->addWidget(m_tabMarket);
     tabsRow->addStretch();
     tabsRow->addWidget(m_targetLabel);
     tabsRow->addWidget(m_fpsLabel);
@@ -694,6 +1113,37 @@ QWidget* LabsMainWindow::buildCenterStage()
     m_monitor = new ControllerMonitorWidget(m_stagePages);
     m_stagePages->addWidget(m_monitor);
 
+    // Page 2: marketplace. Wrapped in an opaque white container so the
+    // engine's theme background (LabsBackgroundWidget) doesn't bleed
+    // through. Same shape the launcher uses to embed this widget; here
+    // we apply it inside the stack instead of next to a sidebar.
+    auto* marketWrap = new QWidget(m_stagePages);
+    marketWrap->setObjectName(QStringLiteral("marketplaceWrap"));
+    marketWrap->setAutoFillBackground(true);
+    marketWrap->setStyleSheet(QStringLiteral(
+        "QWidget#marketplaceWrap { background: #FFFFFF; }"
+    ));
+    auto* marketWrapL = new QVBoxLayout(marketWrap);
+    marketWrapL->setContentsMargins(0, 0, 0, 0);
+    marketWrapL->setSpacing(0);
+    auto* market = new MarketplaceWidget(m_settings.get(), marketWrap);
+    marketWrapL->addWidget(market, 1);
+    m_stagePages->addWidget(marketWrap);
+    connect(market, &MarketplaceWidget::scriptListChanged, this, [this]() {
+        onRefreshScripts();
+    });
+    connect(market, &MarketplaceWidget::runRequested, this, [this](const QString& path) {
+        if (m_scriptCombo) {
+            int idx = m_scriptCombo->findData(path);
+            if (idx < 0) {
+                m_scriptCombo->addItem(QFileInfo(path).fileName(), path);
+                idx = m_scriptCombo->count() - 1;
+            }
+            m_scriptCombo->setCurrentIndex(idx);
+        }
+        onRunScript();
+    });
+
     auto* col = new QVBoxLayout(stage);
     col->setContentsMargins(0, 0, 0, 0);
     col->setSpacing(0);
@@ -705,21 +1155,28 @@ QWidget* LabsMainWindow::buildCenterStage()
 
 bool LabsMainWindow::eventFilter(QObject* obj, QEvent* ev)
 {
+    auto setActive = [this](QLabel* active) {
+        for (QLabel* t : { m_tabVideo, m_tabMonitor, m_tabMarket }) {
+            if (!t) continue;
+            t->setObjectName(t == active ? QStringLiteral("tabActive")
+                                         : QStringLiteral("tabInactive"));
+            t->style()->polish(t);
+        }
+    };
     if (ev->type() == QEvent::MouseButtonRelease) {
         if (obj == m_tabVideo && m_stagePages) {
             m_stagePages->setCurrentIndex(0);
-            m_tabVideo  ->setObjectName(QStringLiteral("tabActive"));
-            m_tabMonitor->setObjectName(QStringLiteral("tabInactive"));
-            m_tabVideo  ->style()->polish(m_tabVideo);
-            m_tabMonitor->style()->polish(m_tabMonitor);
+            setActive(m_tabVideo);
             return true;
         }
         if (obj == m_tabMonitor && m_stagePages) {
             m_stagePages->setCurrentIndex(1);
-            m_tabMonitor->setObjectName(QStringLiteral("tabActive"));
-            m_tabVideo  ->setObjectName(QStringLiteral("tabInactive"));
-            m_tabMonitor->style()->polish(m_tabMonitor);
-            m_tabVideo  ->style()->polish(m_tabVideo);
+            setActive(m_tabMonitor);
+            return true;
+        }
+        if (obj == m_tabMarket && m_stagePages) {
+            m_stagePages->setCurrentIndex(2);
+            setActive(m_tabMarket);
             return true;
         }
     }
@@ -728,37 +1185,195 @@ bool LabsMainWindow::eventFilter(QObject* obj, QEvent* ev)
 
 // ── right rail (devices) ────────────────────────────────────────────────────
 
+// Builds one bridge section (Titan or Cronus) into a parent layout.
+// Fills the provided combo/status/restart/slots/output/usb pointers.
+static void buildBridgeSection(
+        QVBoxLayout* col,
+        const QString& bridgeTitle,
+        const QString& deviceTitle,
+        const QString& scanTip,
+        QComboBox*&   outDeviceCombo,
+        QLabel*&      outDeviceStatus,
+        QPushButton*& outRestartBtn,
+        QLabel*       outSlots[3],
+        QComboBox*&   outOutputCombo,
+        QLabel*       outUsb[4])
+{
+    QWidget* parent = col->parentWidget();
+
+    col->addWidget(sectionLabel(bridgeTitle, parent));
+    col->addSpacing(10);
+
+    // ── Device panel ──────────────────────────────────────────────────────────
+    auto* grpDevice = new QFrame(parent);
+    grpDevice->setObjectName(QStringLiteral("panel"));
+    auto* grpOuter = new QVBoxLayout(grpDevice);
+    grpOuter->setContentsMargins(0, 0, 0, 0);
+    grpOuter->setSpacing(0);
+
+    auto* hdr = new QFrame(grpDevice);
+    hdr->setObjectName(QStringLiteral("panelHeader"));
+    auto* hdrL = new QHBoxLayout(hdr);
+    hdrL->setContentsMargins(12, 8, 12, 8);
+    hdrL->addWidget(sectionLabel(deviceTitle, hdr));
+    grpOuter->addWidget(hdr);
+
+    auto* body = new QWidget(grpDevice);
+    auto* bodyL = new QVBoxLayout(body);
+    bodyL->setSpacing(6);
+    bodyL->setContentsMargins(12, 10, 12, 10);
+    grpOuter->addWidget(body);
+
+    // combo + refresh
+    auto* devRow = new QHBoxLayout;
+    outDeviceCombo = new QComboBox(body);
+    outDeviceCombo->addItem(QStringLiteral("No devices found"));
+    outDeviceCombo->setEnabled(false);
+    auto* scanBtn = new QPushButton(body);
+    scanBtn->setIcon(QIcon(QStringLiteral(":/labs/icon_refresh.svg")));
+    scanBtn->setIconSize(QSize(13, 13));
+    scanBtn->setFixedSize(26, 26);
+    scanBtn->setToolTip(scanTip);
+    devRow->addWidget(outDeviceCombo, 1);
+    devRow->addWidget(scanBtn);
+    bodyL->addLayout(devRow);
+
+    outDeviceStatus = new QLabel(QStringLiteral("No device selected"), body);
+    outDeviceStatus->setObjectName(QStringLiteral("titanStatus"));
+    bodyL->addWidget(outDeviceStatus);
+
+    auto* restartRow = new QHBoxLayout;
+    outRestartBtn = new QPushButton(QStringLiteral("Restart Bridge"), body);
+    outRestartBtn->setEnabled(false);
+    auto* indicator = new QFrame(body);
+    indicator->setObjectName(QStringLiteral("titanIndicator"));
+    indicator->setFixedSize(22, 22);
+    restartRow->addWidget(outRestartBtn, 1);
+    restartRow->addWidget(indicator);
+    bodyL->addLayout(restartRow);
+    col->addWidget(grpDevice);
+    col->addSpacing(8);
+
+    // ── Memory Slots ──────────────────────────────────────────────────────────
+    auto* grpSlots = new QGroupBox(QStringLiteral("Memory Slots"), parent);
+    auto* slotsL = new QVBoxLayout(grpSlots);
+    slotsL->setSpacing(4);
+    slotsL->setContentsMargins(8, 10, 8, 10);
+
+    for (int i = 0; i < 3; ++i) {
+        auto* slotFrame = new QFrame(grpSlots);
+        slotFrame->setObjectName(i == 0 ? QStringLiteral("titanSlotActive")
+                                        : QStringLiteral("titanSlot"));
+        auto* slotRow = new QHBoxLayout(slotFrame);
+        slotRow->setContentsMargins(10, 5, 10, 5);
+
+        auto* num = new QLabel(QString::number(i + 1), slotFrame);
+        num->setObjectName(i == 0 ? QStringLiteral("titanSlotNumActive")
+                                  : QStringLiteral("titanSlotNum"));
+        num->setFixedWidth(18);
+
+        outSlots[i] = new QLabel(QStringLiteral("Empty"), slotFrame);
+        outSlots[i]->setObjectName(i == 0 ? QStringLiteral("titanSlotLabelActive")
+                                           : QStringLiteral("titanSlotLabel"));
+        slotRow->addWidget(num);
+        slotRow->addWidget(outSlots[i], 1);
+        slotsL->addWidget(slotFrame);
+    }
+    col->addWidget(grpSlots);
+    col->addSpacing(8);
+
+    // ── Tabs ──────────────────────────────────────────────────────────────────
+    auto* tabs = new QTabWidget(parent);
+    tabs->setDocumentMode(true);
+
+    auto* cfgTab = new QWidget;
+    auto* cfgL   = new QVBoxLayout(cfgTab);
+    cfgL->setContentsMargins(0, 8, 0, 0);
+    cfgL->setSpacing(6);
+
+    auto* outRow = new QHBoxLayout;
+    outRow->addWidget(new QLabel(QStringLiteral("Output:"), cfgTab));
+    outOutputCombo = new QComboBox(cfgTab);
+    outOutputCombo->addItem(QStringLiteral("Automatic"));
+    outRow->addWidget(outOutputCombo, 1);
+    cfgL->addLayout(outRow);
+
+    auto* grpUsb = new QGroupBox(QStringLiteral("USB Ports"), cfgTab);
+    auto* usbL   = new QVBoxLayout(grpUsb);
+    usbL->setSpacing(3);
+    usbL->setContentsMargins(8, 8, 8, 8);
+
+    const char* ports[] = { "IN A", "IN B", "OUT", "PROG" };
+    for (int i = 0; i < 4; ++i) {
+        auto* row = new QHBoxLayout;
+        auto* lbl = new QLabel(QString::fromLatin1(ports[i]), grpUsb);
+        lbl->setObjectName(QStringLiteral("titanSlotNum")); // reuse dim style
+        lbl->setFixedWidth(38);
+        outUsb[i] = new QLabel(QStringLiteral("Empty"), grpUsb);
+        outUsb[i]->setObjectName(QStringLiteral("titanSlotLabel")); // reuse dim style
+        row->addWidget(lbl);
+        row->addWidget(outUsb[i], 1);
+        usbL->addLayout(row);
+    }
+    cfgL->addWidget(grpUsb);
+    cfgL->addStretch();
+    tabs->addTab(cfgTab, QStringLiteral("Device Config"));
+
+    auto* kmgTab = new QWidget;
+    auto* kmgL   = new QVBoxLayout(kmgTab);
+    auto* kmgLbl = new QLabel(QStringLiteral("KMG Capture\nnot connected"), kmgTab);
+    kmgLbl->setAlignment(Qt::AlignCenter);
+    kmgLbl->setObjectName(QStringLiteral("titanStatus"));
+    kmgL->addWidget(kmgLbl);
+    tabs->addTab(kmgTab, QStringLiteral("KMG Capture"));
+
+    col->addWidget(tabs);
+    col->addSpacing(16);
+}
+
 QWidget* LabsMainWindow::buildDevicesRail()
 {
     auto* rail = new QWidget(this);
     rail->setObjectName(QStringLiteral("rightRail"));
     rail->setFixedWidth(240);
 
-    auto* col = new QVBoxLayout(rail);
-    col->setContentsMargins(22, 22, 22, 22);
+    // Scroll area so both bridges fit
+    auto* scroll = new QScrollArea(rail);
+    scroll->setFrameShape(QFrame::NoFrame);
+    scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    scroll->setWidgetResizable(true);
+
+    auto* inner = new QWidget;
+    auto* col = new QVBoxLayout(inner);
+    col->setContentsMargins(14, 16, 14, 16);
     col->setSpacing(0);
 
-    col->addWidget(sectionLabel(QStringLiteral("devices"), rail));
-    col->addSpacing(14);
+    buildBridgeSection(col,
+        QStringLiteral("Titan Bridge"),
+        QStringLiteral("Titan Two Device"),
+        QStringLiteral("Scan for Titan Two"),
+        m_titanDeviceCombo, m_titanDeviceStatus, m_titanRestartBtn,
+        m_titanSlots, m_titanOutputCombo, m_titanUsbLabels);
 
-    m_devicesList = new QLabel(QStringLiteral("…"), rail);
-    m_devicesList->setObjectName(QStringLiteral("deviceList"));
-    m_devicesList->setWordWrap(true);
-    m_devicesList->setAlignment(Qt::AlignTop);
-    col->addWidget(m_devicesList);
     col->addStretch();
+
+    m_devicesList = new QLabel(inner);
+    m_devicesList->hide();
+
+    scroll->setWidget(inner);
+
+    auto* railLayout = new QVBoxLayout(rail);
+    railLayout->setContentsMargins(0, 0, 0, 0);
+    railLayout->addWidget(scroll);
 
     return rail;
 }
 
 void LabsMainWindow::refreshDevicesList()
 {
-    if (!m_devicesList) return;
-    QStringList lines;
-    for (auto it = m_pluginsByName.constBegin(); it != m_pluginsByName.constEnd(); ++it) {
-        lines << QStringLiteral("• ") + it.key();
-    }
-    m_devicesList->setText(lines.join(QStringLiteral("\n")));
+    if (!m_titanDeviceCombo) return;
+    // Update Titan device combo with any HID devices found
+    // (real Titan Two enumeration goes here — for now reflects plugin state)
 }
 
 // ── mode wiring ─────────────────────────────────────────────────────────────
@@ -767,16 +1382,33 @@ void LabsMainWindow::applyMode(Mode mode)
 {
     stopActiveSource();
 
-    const QString sourceName = (mode == Mode::Xbox)
-        ? QStringLiteral("WGC Capture")
-        : QStringLiteral("PS Remote Play");
+    // Source plugin per mode:
+    //   Xbox Remote Play / xCloud → XboxStreamPlugin (headless Greenlight).
+    //   PS Remote Play           → PSRemotePlayPlugin via labs.dll.
+    // XboxStreamPlugin reads xbox/mode (set in onPair) to decide streamType.
+    const bool xboxFamily = (mode == Mode::Xbox || mode == Mode::Cloud);
 
-    const QString ctrlSinkName = (mode == Mode::Xbox)
-        ? QStringLiteral("ViGEm Output")
-        : QStringLiteral("PS Remote Play");
+    // Xbox family: source/sink come from the focused XboxStreamSession (multi-
+    // session factory pattern). dynamic_cast across the DLL boundary works for
+    // IFrameSource / IControllerSink because both live in LabsCore.
+    // PS family: classic single-source plugin lookup.
+    if (xboxFamily) {
+        QObject* sessObj = m_focusedXboxSession.data();
+        m_activeSource   = sessObj ? dynamic_cast<IFrameSource*>(sessObj)    : nullptr;
+        m_activeCtrlSink = sessObj ? dynamic_cast<IControllerSink*>(sessObj) : nullptr;
+    } else {
+        m_activeSource   = m_frameSources.value(QStringLiteral("PS Remote Play"), nullptr);
+        m_activeCtrlSink = m_ctrlSinks.value(QStringLiteral("PS Remote Play"), nullptr);
+    }
 
-    m_activeSource   = m_frameSources.value(sourceName,  nullptr);
-    m_activeCtrlSink = m_ctrlSinks   .value(ctrlSinkName, nullptr);
+    // Tell XInput whether to keep emitting an idle baseline when no physical
+    // pad is plugged in. Both Xbox modes need this so InputOverride scripts
+    // get a 125Hz baseline to patch onto. PS mode goes silent when pad is
+    // unplugged, which is correct chiaki behavior.
+    if (IPlugin* xi = m_pluginsByName.value(QStringLiteral("XInput"), nullptr)) {
+        QMetaObject::invokeMethod(xi->qobject(), "setIdleEmit", Qt::DirectConnection,
+                                  Q_ARG(bool, xboxFamily));
+    }
 
     if (m_activeSource) m_activeSource->setSink(m_fanOut.get());
 
@@ -784,16 +1416,61 @@ void LabsMainWindow::applyMode(Mode mode)
     // connected so the pad visualization keeps updating regardless of mode.
     s_ctrlFanOut.setOutput(m_activeCtrlSink);
 
-    // No skip mask. The original design skipped slot 0 in PS mode so the
-    // physical Xbox pad wouldn't double-write with SecretK's augmented
-    // virtual pad on a higher slot. With DualSense going through its own
-    // dedicated source (DualSenseSource → fan-out, bypassing XInput entirely),
-    // the only thing on XInput slots is SecretK's vgamepad VX360 release
-    // pulses — which we WANT to forward. Last-write-wins is fine; pulses
-    // overlap user input only briefly during a release.
+    // Swap the center stage widget. xCloud uses the embedded WebView2 (Xbox
+    // Web plugin); other modes use the standard Display widget that consumes
+    // the IFrameSink fan-out.
+    const QString uiName = (mode == Mode::Cloud)
+                           ? QStringLiteral("Xbox Web")
+                           : QStringLiteral("Display");
+
+    if (m_stageHost && m_stageHost->layout()) {
+        for (int i = 0; i < m_stageHost->layout()->count(); ++i) {
+            QWidget* w = m_stageHost->layout()->itemAt(i)
+                ? m_stageHost->layout()->itemAt(i)->widget() : nullptr;
+            if (!w) continue;
+            const bool match = (w->property("uiPluginName").toString() == uiName);
+            w->setVisible(match);
+        }
+    }
+    // Make sure the central stage stack is on the video page (m_stageHost)
+    // so the WebView2 / Display widget is actually visible.
+    if (m_stagePages && m_stageHost) m_stagePages->setCurrentWidget(m_stageHost);
+
+    // ALWAYS skip the ViGEm slot regardless of mode. Two reasons:
+    //   1. Xbox mode: prevents XInput from reading back the override we
+    //      just wrote (feedback loop that would freeze the pad on the
+    //      last override value after expiry).
+    //   2. PS mode with an Xbox controller: ViGEm's virtual X360 sits on
+    //      a slot already; if we don't skip it, XInput finds the silent
+    //      virtual pad first and binds there, leaving the user's real
+    //      Xbox controller (on a higher slot) invisible.
+    // PS mode with DualSense doesn't care either way — DualSensePlugin
+    // reads HID directly, separate from XInput.
+    int xiSkipMask = 0;
+    int viGemSlot  = -1;
+    if (IPlugin* vg = m_pluginsByName.value(QStringLiteral("ViGEm Output"), nullptr)) {
+        QMetaObject::invokeMethod(vg->qobject(), "userIndex", Qt::DirectConnection,
+                                  Q_RETURN_ARG(int, viGemSlot));
+        if (viGemSlot >= 0 && viGemSlot < 4) xiSkipMask = (1 << viGemSlot);
+    }
     if (IPlugin* xi = m_pluginsByName.value(QStringLiteral("XInput"), nullptr)) {
         QMetaObject::invokeMethod(xi->qobject(), "setSkipMask", Qt::DirectConnection,
-                                  Q_ARG(int, 0));
+                                  Q_ARG(int, xiSkipMask));
+    }
+    qInfo() << "applyMode: mode="
+            << (mode == Mode::Xbox  ? "Xbox Remote Play"
+              : mode == Mode::Cloud ? "xCloud"
+                                    : "PS Remote Play")
+            << "viGemSlot=" << viGemSlot << "xinputSkipMask=" << xiSkipMask;
+
+    // WGC capture is no longer needed for any streaming mode — XboxStream
+    // produces decoded H.264 frames natively, and PS Remote Play's chiaki
+    // layer feeds frames directly. Stop any leftover WGC capture from
+    // a previous session (e.g. if the user manually launched a window
+    // capture).
+    if (IPlugin* wgc = m_pluginsByName.value(QStringLiteral("WGC Capture"), nullptr)) {
+        QMetaObject::invokeMethod(wgc->qobject(), "stopCapture",
+                                  Qt::DirectConnection);
     }
 
     updateActions();
@@ -806,29 +1483,390 @@ void LabsMainWindow::stopActiveSource()
     if (m_fpsLabel) m_fpsLabel->setText(QStringLiteral("— fps"));
 }
 
+// ── multi-session XboxStream wiring ─────────────────────────────────────────
+
+// XboxStreamPlugin's methods + signals are accessed by NAME via Qt's meta
+// system. The engine doesn't link to the plugin DLL, so direct member calls
+// would be unresolved externals at link time. String-based connect + invokeMethod
+// dispatches at runtime through the loaded plugin's metaobject.
+
+// XboxStreamPlugin's methods + signals are accessed by NAME via Qt's meta
+// system. The engine doesn't link to the plugin DLL, so direct member calls
+// or qobject_cast to plugin types would be unresolved externals at link time.
+// String-based connect + invokeMethod dispatches at runtime through the
+// loaded plugin's metaobject. Casting to IFrameSource/IControllerSink uses
+// dynamic_cast (those interfaces live in LabsCore which both link to).
+
+void LabsMainWindow::hookXboxStreamSignals()
+{
+    IPlugin* p = m_pluginsByName.value(QStringLiteral("Xbox Stream"), nullptr);
+    if (!p) return;
+    QObject* xs = p->qobject();
+    if (!xs) return;
+    connect(xs, SIGNAL(sessionAdded(int)),
+            this, SLOT(onXboxSessionAdded(int)));
+    connect(xs, SIGNAL(sessionRemoved(int)),
+            this, SLOT(onXboxSessionRemoved(int)));
+    // The HWND-ready signal fires per-session — connect once globally to the
+    // plugin, but the actual signal lives on each XboxStreamSession. Defer
+    // the per-session hookup to onXboxSessionAdded.
+}
+
+void LabsMainWindow::hookXboxWebSignals()
+{
+    IPlugin* p = m_pluginsByName.value(QStringLiteral("Xbox Web"), nullptr);
+    if (!p) return;
+    QObject* xw = p->qobject();
+    if (!xw) return;
+    connect(xw, SIGNAL(runScriptRequested(int)),  this, SLOT(onXboxWebRunRequested(int)));
+    connect(xw, SIGNAL(stopScriptRequested(int)), this, SLOT(onXboxWebStopRequested(int)));
+    connect(xw, SIGNAL(sessionRemoved(int)),      this, SLOT(onXboxWebSessionRemoved(int)));
+}
+
+void LabsMainWindow::onXboxWebRunRequested(int sessionId)
+{
+    spawnXboxSessionScript(sessionId);
+}
+
+void LabsMainWindow::onXboxWebStopRequested(int sessionId)
+{
+    killXboxSessionScript(sessionId);
+}
+
+void LabsMainWindow::onXboxWebSessionRemoved(int sessionId)
+{
+    killXboxSessionScript(sessionId);
+}
+
+void LabsMainWindow::spawnXboxSessionScript(int sessionId)
+{
+    if (m_xboxScriptProcs.contains(sessionId)) return;
+    if (!m_scriptCombo) return;
+    const QString scriptPath = m_scriptCombo->currentData().toString();
+    if (scriptPath.isEmpty() || !QFileInfo::exists(scriptPath)) {
+        appendLog(QStringLiteral("xCloud session #%1 — no script selected").arg(sessionId));
+        return;
+    }
+    auto* proc = new QProcess(this);
+    proc->setProgram(QStringLiteral("python"));
+    QStringList args;
+    args << scriptPath
+         << QStringLiteral("--session-id") << QString::number(sessionId);
+    if (m_perfLiteBtn && m_perfLiteBtn->isChecked()) args << QStringLiteral("--low-end");
+    proc->setArguments(args);
+    proc->setProcessChannelMode(QProcess::MergedChannels);
+    connect(proc, &QProcess::readyReadStandardOutput, this, [this, sessionId, proc]() {
+        const QByteArray bytes = proc->readAllStandardOutput();
+        for (const QByteArray& line : bytes.split('\n')) {
+            const QString l = QString::fromUtf8(line).trimmed();
+            if (!l.isEmpty()) appendLog(QStringLiteral("[s%1] %2").arg(sessionId).arg(l));
+        }
+    });
+    connect(proc, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this,
+            [this, sessionId](int code, QProcess::ExitStatus) {
+        appendLog(QStringLiteral("xCloud session #%1 script exited (%2)").arg(sessionId).arg(code));
+        QProcess* p = m_xboxScriptProcs.take(sessionId);
+        if (p) p->deleteLater();
+        IPlugin* plg = m_pluginsByName.value(QStringLiteral("Xbox Web"), nullptr);
+        if (plg && plg->qobject()) {
+            QMetaObject::invokeMethod(plg->qobject(), "setSessionScriptRunning",
+                                      Qt::DirectConnection,
+                                      Q_ARG(int, sessionId), Q_ARG(bool, false));
+        }
+    });
+    proc->start();
+    if (!proc->waitForStarted(2000)) {
+        appendLog(QStringLiteral("xCloud session #%1 — script spawn failed: %2")
+                  .arg(sessionId).arg(proc->errorString()));
+        proc->deleteLater();
+        return;
+    }
+    m_xboxScriptProcs.insert(sessionId, proc);
+    appendLog(QStringLiteral("xCloud session #%1 — running %2").arg(sessionId)
+              .arg(QFileInfo(scriptPath).fileName()));
+    IPlugin* plg = m_pluginsByName.value(QStringLiteral("Xbox Web"), nullptr);
+    if (plg && plg->qobject()) {
+        QMetaObject::invokeMethod(plg->qobject(), "setSessionScriptRunning",
+                                  Qt::DirectConnection,
+                                  Q_ARG(int, sessionId), Q_ARG(bool, true));
+    }
+}
+
+void LabsMainWindow::killXboxSessionScript(int sessionId)
+{
+    QProcess* proc = m_xboxScriptProcs.value(sessionId, nullptr);
+    if (!proc) return;
+    if (proc->state() != QProcess::NotRunning) {
+        proc->terminate();
+        if (!proc->waitForFinished(1500)) proc->kill();
+    }
+    // The finished() handler removes from m_xboxScriptProcs and updates UI.
+}
+
+void LabsMainWindow::buildXboxContainer()
+{
+    if (m_xboxContainer || !m_stagePages) return;
+
+    m_xboxContainer = new QWidget(m_stagePages);
+    m_xboxContainer->setObjectName(QStringLiteral("xboxContainer"));
+    m_xboxContainer->setStyleSheet(QStringLiteral("background:#070A14;"));
+    auto* col = new QVBoxLayout(m_xboxContainer);
+    col->setContentsMargins(0, 0, 0, 0);
+    col->setSpacing(0);
+
+    // Thin tab strip at top: one button per session, click to switch.
+    m_xboxTabStrip = new QWidget(m_xboxContainer);
+    m_xboxTabStrip->setObjectName(QStringLiteral("xboxTabStrip"));
+    m_xboxTabStrip->setFixedHeight(34);
+    m_xboxTabStrip->setStyleSheet(QStringLiteral("background:#0B1020; border-bottom:1px solid #1E2A4A;"));
+    auto* tabRow = new QHBoxLayout(m_xboxTabStrip);
+    tabRow->setContentsMargins(10, 4, 10, 4);
+    tabRow->setSpacing(6);
+    tabRow->addStretch();
+    col->addWidget(m_xboxTabStrip);
+
+    m_xboxStack = new QStackedWidget(m_xboxContainer);
+    m_xboxStack->setObjectName(QStringLiteral("xboxStack"));
+    col->addWidget(m_xboxStack, 1);
+
+    // Add as its own page in the central stage stack so it gets the full
+    // stage area when active. Switching between video / monitor / xbox is
+    // handled in showXboxContainer.
+    m_stagePages->addWidget(m_xboxContainer);
+}
+
+namespace {
+// Re-parent a top-level Win32 window into a Qt widget. Strips the OS frame
+// so it behaves like a child control, then SetParent + position to fill.
+void reparentChildHwnd(HWND child, HWND parent, int w, int h)
+{
+    if (!child || !parent) return;
+    LONG style = GetWindowLong(child, GWL_STYLE);
+    style &= ~(WS_OVERLAPPEDWINDOW | WS_CAPTION | WS_THICKFRAME | WS_MINIMIZE | WS_MAXIMIZE | WS_SYSMENU);
+    style |= WS_CHILD | WS_VISIBLE;
+    SetWindowLong(child, GWL_STYLE, style);
+    SetParent(child, parent);
+    SetWindowPos(child, nullptr, 0, 0, w, h,
+                 SWP_FRAMECHANGED | SWP_NOZORDER | SWP_SHOWWINDOW);
+}
+
+// QWidget that owns a reparented HWND and resizes it to fill on every layout.
+class EmbeddedHwndHost : public QWidget {
+public:
+    explicit EmbeddedHwndHost(quintptr hwnd, QWidget* parent = nullptr)
+        : QWidget(parent), m_child(reinterpret_cast<HWND>(hwnd)) {
+        setAttribute(Qt::WA_NativeWindow);
+        setAttribute(Qt::WA_DontCreateNativeAncestors);
+        setMinimumSize(640, 360);
+    }
+    void showEvent(QShowEvent*) override {
+        if (m_child && !m_attached) {
+            reparentChildHwnd(m_child, reinterpret_cast<HWND>(winId()), width(), height());
+            m_attached = true;
+        }
+    }
+    void resizeEvent(QResizeEvent* e) override {
+        if (m_child && m_attached) {
+            SetWindowPos(m_child, nullptr, 0, 0, e->size().width(), e->size().height(),
+                         SWP_NOZORDER);
+        }
+    }
+private:
+    HWND m_child = nullptr;
+    bool m_attached = false;
+};
+} // namespace
+
+void LabsMainWindow::embedXboxHwnd(int sessionId, quintptr hwnd, const QString& label)
+{
+    buildXboxContainer();
+    if (!m_xboxStack) return;
+
+    // Replace existing host for this session if it was already wired.
+    if (m_xboxHosts.contains(sessionId)) {
+        QWidget* old = m_xboxHosts.take(sessionId);
+        if (old) {
+            m_xboxStack->removeWidget(old);
+            old->deleteLater();
+        }
+    }
+
+    auto* host = new EmbeddedHwndHost(hwnd, m_xboxStack);
+    m_xboxStack->addWidget(host);
+    m_xboxHosts.insert(sessionId, host);
+    m_xboxStack->setCurrentWidget(host);
+
+    // Add a tab button in the strip for this session.
+    if (!m_xboxTabs.contains(sessionId) && m_xboxTabStrip) {
+        auto* btn = new QPushButton(label.isEmpty() ? QStringLiteral("session %1").arg(sessionId) : label,
+                                    m_xboxTabStrip);
+        btn->setProperty("ghost", true);
+        btn->setCursor(Qt::PointingHandCursor);
+        connect(btn, &QPushButton::clicked, this, [this, sessionId]() {
+            QWidget* w = m_xboxHosts.value(sessionId, nullptr);
+            if (w) m_xboxStack->setCurrentWidget(w);
+        });
+        // Insert before the trailing stretch (last item).
+        auto* row = qobject_cast<QHBoxLayout*>(m_xboxTabStrip->layout());
+        if (row) row->insertWidget(row->count() - 1, btn);
+        m_xboxTabs.insert(sessionId, btn);
+    }
+
+    showXboxContainer(true);
+}
+
+void LabsMainWindow::removeXboxHost(int sessionId)
+{
+    if (m_xboxStack && m_xboxHosts.contains(sessionId)) {
+        QWidget* w = m_xboxHosts.take(sessionId);
+        if (w) {
+            m_xboxStack->removeWidget(w);
+            w->deleteLater();
+        }
+    }
+    if (m_xboxTabs.contains(sessionId)) {
+        QPushButton* btn = m_xboxTabs.take(sessionId);
+        if (btn) btn->deleteLater();
+    }
+    if (m_xboxStack && m_xboxStack->count() == 0) {
+        showXboxContainer(false);
+    }
+}
+
+void LabsMainWindow::showXboxContainer(bool show)
+{
+    if (!m_xboxContainer || !m_stagePages) return;
+    if (show) {
+        m_stagePages->setCurrentWidget(m_xboxContainer);
+    } else {
+        // Default back to the video display stage.
+        if (m_stageHost) m_stagePages->setCurrentWidget(m_stageHost);
+    }
+}
+
+void LabsMainWindow::onXboxWindowHwndReady(int sessionId, quintptr hwnd)
+{
+    if (!hwnd) return;
+    QString label;
+    // Look up the session's account label for the tab text.
+    IPlugin* p = m_pluginsByName.value(QStringLiteral("Xbox Stream"), nullptr);
+    if (p) {
+        QObject* xs = p->qobject();
+        QObject* sessObj = nullptr;
+        if (xs) {
+            QMetaObject::invokeMethod(xs, "sessionByIdObject", Qt::DirectConnection,
+                                      Q_RETURN_ARG(QObject*, sessObj),
+                                      Q_ARG(int, sessionId));
+            if (auto* fs = dynamic_cast<IFrameSource*>(sessObj)) label = fs->targetLabel();
+        }
+    }
+    embedXboxHwnd(sessionId, hwnd, label);
+    appendLog(QStringLiteral("xCloud session #%1 embedded").arg(sessionId));
+}
+
+void LabsMainWindow::onXboxSessionAdded(int id)
+{
+    IPlugin* p = m_pluginsByName.value(QStringLiteral("Xbox Stream"), nullptr);
+    if (!p) return;
+    QObject* xs = p->qobject();
+    if (!xs) return;
+    QObject* sessObj = nullptr;
+    QMetaObject::invokeMethod(xs, "sessionByIdObject", Qt::DirectConnection,
+                              Q_RETURN_ARG(QObject*, sessObj),
+                              Q_ARG(int, id));
+    if (!sessObj) return;
+    QString label;
+    auto* fs = dynamic_cast<IFrameSource*>(sessObj);
+    if (fs) label = fs->targetLabel();
+    appendLog(QStringLiteral("xbox session #%1 added (%2)").arg(id).arg(label));
+    // Per-session connection: when the cloud sidecar reports its window HWND,
+    // embed it. String-form connect because we don't link the plugin DLL.
+    connect(sessObj, SIGNAL(windowHwndReady(int,quintptr)),
+            this, SLOT(onXboxWindowHwndReady(int,quintptr)));
+    // If the session already has an HWND (e.g. fast loadURL completed before
+    // we wired up the signal), fetch it now and embed.
+    quintptr existing = 0;
+    QMetaObject::invokeMethod(sessObj, "windowHwnd", Qt::DirectConnection,
+                              Q_RETURN_ARG(quintptr, existing));
+    if (existing) onXboxWindowHwndReady(id, existing);
+    if (!m_focusedXboxSession) focusXboxSession(sessObj);
+}
+
+void LabsMainWindow::onXboxSessionRemoved(int id)
+{
+    appendLog(QStringLiteral("xbox session #%1 removed").arg(id));
+    removeXboxHost(id);
+
+    // Tell CvPython to close that session's frame SHM block. Matches the
+    // 100..107 namespace stamped by XboxStreamSession::pushFrame.
+    if (auto* cv = m_pluginsByName.value(QStringLiteral("CV Python"), nullptr); cv && cv->qobject()) {
+        QMetaObject::invokeMethod(cv->qobject(), "closeSession",
+                                  Qt::DirectConnection,
+                                  Q_ARG(int, 100 + id));
+    }
+    if (m_focusedXboxSession && m_focusedXboxSessionId == id) {
+        m_focusedXboxSession.clear();
+        m_focusedXboxSessionId = -1;
+        // Try to focus another remaining session if any.
+        IPlugin* p = m_pluginsByName.value(QStringLiteral("Xbox Stream"), nullptr);
+        if (!p) return;
+        QObject* xs = p->qobject();
+        if (!xs) return;
+        int count = 0;
+        QMetaObject::invokeMethod(xs, "sessionCount", Qt::DirectConnection,
+                                  Q_RETURN_ARG(int, count));
+        if (count > 0) {
+            QObject* sessObj = nullptr;
+            QMetaObject::invokeMethod(xs, "sessionAtObject", Qt::DirectConnection,
+                                      Q_RETURN_ARG(QObject*, sessObj),
+                                      Q_ARG(int, 0));
+            if (sessObj) focusXboxSession(sessObj);
+        }
+    }
+}
+
+void LabsMainWindow::focusXboxSession(QObject* session)
+{
+    if (!session) return;
+    m_focusedXboxSession = session;
+    int sid = -1;
+    QMetaObject::invokeMethod(session, "id", Qt::DirectConnection,
+                              Q_RETURN_ARG(int, sid));
+    m_focusedXboxSessionId = sid;
+    if (m_modeBox) {
+        const Mode mode = static_cast<Mode>(qBound(0, m_modeBox->currentIndex(), 2));
+        if (mode == Mode::Xbox || mode == Mode::Cloud) {
+            applyMode(mode);
+        }
+    }
+    appendLog(QStringLiteral("focused xbox session #%1").arg(sid));
+}
+
 void LabsMainWindow::onModeChanged(int index)
 {
-    applyMode(static_cast<Mode>(qBound(0, index, 1)));
+    applyMode(static_cast<Mode>(qBound(0, index, 2)));
     qInfo() << "mode:" << m_modeBox->currentText();
 }
 
 // ── actions ─────────────────────────────────────────────────────────────────
 
-void LabsMainWindow::onPickWindow()
-{
-    if (!m_activeSource) return;
-    const quintptr hwnd = static_cast<quintptr>(winId());
-    if (m_activeSource->showPicker(hwnd)) {
-        qInfo() << "target:" << m_activeSource->targetLabel();
-    }
-    updateActions();
-}
-
 void LabsMainWindow::onPair()
 {
     const Mode mode = static_cast<Mode>(m_modeBox->currentIndex());
-    const QString name = (mode == Mode::PS) ? QStringLiteral("PS Remote Play") : QString();
-    if (name.isEmpty()) return;
+
+    // Both Xbox modes (Remote Play / xCloud) use the same plugin — only the
+    // streamType differs. Persist that so the sidecar picks the right one.
+    if (mode == Mode::Xbox || mode == Mode::Cloud) {
+        if (m_settings) {
+            m_settings->setValue(QStringLiteral("xbox/mode"),
+                mode == Mode::Cloud ? QStringLiteral("cloud") : QStringLiteral("home"));
+            m_settings->sync();
+        }
+    }
+
+    const QString name = (mode == Mode::PS)
+        ? QStringLiteral("PS Remote Play")
+        : QStringLiteral("Xbox Stream");
     IPlugin* p = m_pluginsByName.value(name, nullptr);
     if (auto* pr = dynamic_cast<IPairablePlugin*>(p)) {
         if (pr->pair(this)) appendLog(QStringLiteral("paired"));
@@ -889,11 +1927,16 @@ void LabsMainWindow::onStart()
         if (m_targetLabel) m_targetLabel->setText(label);
         m_scriptStatus->setText(QStringLiteral("running"));
         appendLog(QStringLiteral("Engine started — %1").arg(label.isEmpty() ? QStringLiteral("no target") : label));
+
+        // No WGC fallback wiring — XboxStream and PS Remote Play both produce
+        // decoded frames natively through the IFrameSink fan-out.
     } else {
         const Mode mode = static_cast<Mode>(m_modeBox->currentIndex());
-        appendLog(mode == Mode::PS
-            ? QStringLiteral("PS start failed — check [ps] settings (pair first)")
-            : QStringLiteral("start failed — pick a window first"));
+        const QString msg =
+            mode == Mode::PS    ? QStringLiteral("PS start failed — check [ps] settings (pair first)")
+          : mode == Mode::Cloud ? QStringLiteral("xCloud start failed — click pair… and sign in first")
+                                : QStringLiteral("Xbox Remote Play start failed — click pair… and sign in first");
+        appendLog(msg);
     }
     updateActions();
 }
@@ -901,6 +1944,10 @@ void LabsMainWindow::onStart()
 void LabsMainWindow::onStop()
 {
     stopActiveSource();
+    // Stop WGC too — no point burning cycles capturing when nothing's streaming
+    if (IPlugin* wgc = m_pluginsByName.value(QStringLiteral("WGC Capture"), nullptr)) {
+        QMetaObject::invokeMethod(wgc->qobject(), "stopCapture", Qt::DirectConnection);
+    }
     if (m_targetLabel) m_targetLabel->setText(QString());
     m_scriptStatus->setText(QStringLiteral("idle"));
     appendLog(QStringLiteral("Engine stopped"));
@@ -913,7 +1960,41 @@ void LabsMainWindow::onFpsTick()
     const qint64 now = m_activeSource->frameCount();
     const qint64 delta = now - m_lastFrameCount;
     m_lastFrameCount = now;
+    // All three streaming modes (Xbox RP / xCloud / PS RP) push decoded
+    // frames through the IFrameSink, so a real fps number is always available.
     m_fpsLabel->setText(QStringLiteral("%1 fps").arg(delta));
+}
+
+void LabsMainWindow::onRefreshScripts()
+{
+    if (!m_scriptCombo) return;
+
+    const QString currentPath = m_scriptCombo->currentData().toString();
+    const QString scriptsDir  = userScriptsDir();
+
+    QStringList found;
+    for (const QFileInfo& fi : QDir(scriptsDir).entryInfoList(
+             QStringList{QStringLiteral("*.py")}, QDir::Files, QDir::Name)) {
+        if (fi.fileName().startsWith(QChar('_'))) continue;
+        if (fi.completeBaseName().endsWith(QStringLiteral("_test"))) continue;
+        found << fi.absoluteFilePath();
+    }
+    // Preserve a custom path the user picked via Browse if it lives outside
+    // the scripts folder.
+    if (!currentPath.isEmpty() && QFileInfo::exists(currentPath) && !found.contains(currentPath))
+        found.prepend(currentPath);
+
+    m_scriptCombo->blockSignals(true);
+    m_scriptCombo->clear();
+    for (const QString& p : found)
+        m_scriptCombo->addItem(QFileInfo(p).fileName(), p);
+    int idx = currentPath.isEmpty() ? 0 : m_scriptCombo->findData(currentPath);
+    if (idx < 0 && m_scriptCombo->count() > 0) idx = 0;
+    if (idx >= 0) m_scriptCombo->setCurrentIndex(idx);
+    m_scriptCombo->blockSignals(false);
+
+    appendLog(QStringLiteral("scripts refreshed — %1 found").arg(found.size()));
+    updateActions();
 }
 
 void LabsMainWindow::onBrowseScript()
@@ -1022,8 +2103,7 @@ void LabsMainWindow::updateActions()
     const Mode mode = static_cast<Mode>(m_modeBox ? m_modeBox->currentIndex() : 0);
     const bool scriptRunning = m_scriptProc && m_scriptProc->state() != QProcess::NotRunning;
 
-    if (m_btnPick)      m_btnPick ->setEnabled(haveSource && !running && mode == Mode::Xbox);
-    if (m_btnPair)      m_btnPair ->setEnabled(!running && mode == Mode::PS);
+    if (m_btnPair)      m_btnPair ->setEnabled(!running);
     if (m_btnStart) {
         m_btnStart->setEnabled(haveSource && !running);
         m_btnStart->setVisible(!running);

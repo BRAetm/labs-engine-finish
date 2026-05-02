@@ -37,14 +37,6 @@ static void labsMsgHandler(QtMsgType type, const QMessageLogContext& ctx, const 
     if (type == QtFatalMsg) std::abort();
 }
 
-static bool ensureSingleInstance()
-{
-    static QSharedMemory guard(QStringLiteral("LabsEngine_SingleInstance"));
-    if (guard.create(1)) return true;
-    guard.attach();
-    return false;
-}
-
 int main(int argc, char* argv[])
 {
     // Install abort/crash breadcrumb before anything else can fail.
@@ -58,6 +50,17 @@ int main(int argc, char* argv[])
     app.setApplicationName(QStringLiteral("Labs Engine"));
     app.setOrganizationName(QStringLiteral("Labs"));
     app.setApplicationVersion(QStringLiteral("1.0.0"));
+
+    // QSharedMemory MUST be constructed AFTER QApplication. Per Qt docs it
+    // depends on the QCoreApplication event loop and instance(); a file-scope
+    // static would construct before main()'s QApplication and is UB.
+    QSharedMemory guard(QStringLiteral("LabsEngine_SingleInstance"));
+    const bool singleInstance = guard.create(1);
+    if (!singleInstance) {
+        // Another instance owns the segment — attach so we don't leave a
+        // stale handle, then bail.
+        guard.attach();
+    }
 
     // App icon — resource-embedded .ico. Flows to taskbar, window title bars,
     // and every child dialog (QDialog inherits the app icon by default).
@@ -78,8 +81,16 @@ int main(int argc, char* argv[])
     qInstallMessageHandler(labsMsgHandler);
     qInfo() << "Labs Engine starting; log ->" << gLogFile->fileName();
 
-    if (!ensureSingleInstance()) {
+    if (!singleInstance) {
         qWarning() << "another instance is already running";
+        // Tear down the message handler + log file before bailing so we
+        // don't leak the QFile* through the early return.
+        qInstallMessageHandler(nullptr);
+        if (gLogFile) {
+            gLogFile->close();
+            delete gLogFile;
+            gLogFile = nullptr;
+        }
         return 1;
     }
 
@@ -87,5 +98,16 @@ int main(int argc, char* argv[])
     Labs::LabsMainWindow window;
     qInfo() << "main window constructed; showing";
     window.show();
-    return app.exec();
+    const int appResult = app.exec();
+
+    // Uninstall the message handler BEFORE we delete gLogFile, otherwise a
+    // late shutdown qDebug/qWarning would reach a dangling QFile*. Then
+    // close + delete the log file. Order matters here.
+    qInstallMessageHandler(nullptr);
+    if (gLogFile) {
+        gLogFile->close();
+        delete gLogFile;
+        gLogFile = nullptr;
+    }
+    return appResult;
 }

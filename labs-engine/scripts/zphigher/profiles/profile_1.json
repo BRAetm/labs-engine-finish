@@ -1,0 +1,18 @@
+{
+  "shooting": {
+    "rt": 30,
+    "l2": 67,
+    "tempo": 72,
+    "tempo_on": true
+  },
+  "features": {
+    "stamina": false,
+    "defense": true,
+    "latency": false
+  },
+  "system": {
+    "capture": "",
+    "gpu": "D",
+    "pc_mode": 1
+  }
+}

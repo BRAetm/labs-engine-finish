@@ -21,6 +21,13 @@ protected:
 private:
     QImage m_image;
     QMutex m_mx;
+    // Lanczos-resize cache. paintEvent rebuilds m_scaled only when the
+    // input (m_image) or target (m_scaledFor) changes — Qt may repaint
+    // for reasons unrelated to a new frame (focus, overlay, hover) and
+    // each redundant scale is ~5-10 ms of CPU at 1080p.
+    QImage m_scaled;
+    QSize  m_scaledFor;
+    bool   m_scaledDirty = true;
 };
 
 class DisplayPlugin : public QObject, public IUIPlugin, public IFrameSinkPlugin, public IFrameSink {

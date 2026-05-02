@@ -1,0 +1,19 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Xbox Sidecar (spike)</title>
+  <style>
+    body { margin: 0; background: #111; color: #cfc; font-family: Consolas, monospace; font-size: 12px; }
+    #streamHolder video { width: 1280px; height: 720px; background: #000; display: block; }
+    #log { padding: 6px 10px; max-height: 50vh; overflow-y: auto; white-space: pre-wrap; }
+    h3 { margin: 6px 10px; color: #8f8; }
+  </style>
+</head>
+<body>
+  <div id="streamHolder"></div>
+  <h3>sidecar log</h3>
+  <div id="log"></div>
+  <script src="./renderer.js"></script>
+</body>
+</html>

@@ -20,18 +20,24 @@ int PluginHost::loadAll(const QString& pluginDir)
     const auto entries = dir.entryInfoList({"*.dll"}, QDir::Files);
     int loaded = 0;
     for (const auto& info : entries) {
-        QLibrary lib(info.absoluteFilePath());
-        if (!lib.load()) {
+        // Heap-allocate. The QLibrary must outlive the IPlugin* so the DLL's
+        // code/vtable stays mapped. A stack-local lib gets eagerly unloaded
+        // by Qt when it goes out of scope here, which would dangle every
+        // plugin pointer.
+        QLibrary* lib = new QLibrary(info.absoluteFilePath());
+        if (!lib->load()) {
             qWarning().nospace() << "PluginHost: failed to load " << info.fileName()
-                                  << " — " << lib.errorString();
+                                  << " — " << lib->errorString();
+            delete lib;
             continue;
         }
 
-        auto fn = reinterpret_cast<CreatePluginFn>(lib.resolve("createPlugin"));
+        auto fn = reinterpret_cast<CreatePluginFn>(lib->resolve("createPlugin"));
         if (!fn) {
             qWarning().nospace() << "PluginHost: " << info.fileName()
                                   << " has no createPlugin export";
-            lib.unload();
+            lib->unload();
+            delete lib;
             continue;
         }
 
@@ -41,15 +47,24 @@ int PluginHost::loadAll(const QString& pluginDir)
         } catch (const std::exception& e) {
             qWarning().nospace() << "PluginHost: " << info.fileName()
                                   << " threw during createPlugin: " << e.what();
+            lib->unload();
+            delete lib;
             continue;
         } catch (...) {
             qWarning().nospace() << "PluginHost: " << info.fileName()
                                   << " threw unknown exception during createPlugin";
+            lib->unload();
+            delete lib;
             continue;
         }
         if (p) {
+            m_records.push_back(Record{ p, lib });
             m_plugins.push_back(p);
             ++loaded;
+        } else {
+            // createPlugin returned null — drop the DLL too, no client.
+            lib->unload();
+            delete lib;
         }
     }
     return loaded;
@@ -57,9 +72,25 @@ int PluginHost::loadAll(const QString& pluginDir)
 
 void PluginHost::unloadAll()
 {
-    for (IPlugin* p : m_plugins) {
-        if (p) { p->shutdown(); delete p; }
+    // Reverse order: tear down later-loaded plugins first. Then for each
+    // record, destroy the plugin object (its dtor uses code in the DLL),
+    // and ONLY THEN unload the DLL. Destroying after unload would jump
+    // into an unmapped page.
+    for (int i = m_records.size() - 1; i >= 0; --i) {
+        Record& r = m_records[i];
+        if (r.plugin) {
+            try { r.plugin->shutdown(); }
+            catch (...) { /* swallow — keep tearing down */ }
+            delete r.plugin;
+            r.plugin = nullptr;
+        }
+        if (r.lib) {
+            r.lib->unload();
+            delete r.lib;
+            r.lib = nullptr;
+        }
     }
+    m_records.clear();
     m_plugins.clear();
 }
 

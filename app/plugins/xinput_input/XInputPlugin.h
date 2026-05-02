@@ -22,6 +22,12 @@ public:
     // bit N set → skip slot N. Reset active slot so the next poll re-latches.
     void setSkipMask(int mask) { m_skipMask = mask; m_activeSlot = -1; }
 
+    // When true, poll() pushes a connected zero-state every tick if no
+    // physical pad is detected. Keeps the downstream fan-out + InputOverride
+    // running so script-driven SHM overrides still reach ViGEm at 125Hz
+    // even with no controller plugged in.
+    void setIdleEmit(bool on) { m_idleEmit = on; }
+
 private slots:
     void poll();
 
@@ -31,6 +37,7 @@ private:
     std::atomic<bool> m_running { false };
     int               m_activeSlot = -1;
     int               m_skipMask   = 0;
+    bool              m_idleEmit   = false;
 };
 
 class XInputPlugin : public QObject, public IControllerSourcePlugin {
@@ -53,6 +60,7 @@ public:
     // Invokable across DLL boundaries via QMetaObject::invokeMethod so
     // LabsMainWindow can tell XInput which slots to skip per mode.
     Q_INVOKABLE void setSkipMask(int mask) { if (m_source) m_source->setSkipMask(mask); }
+    Q_INVOKABLE void setIdleEmit(bool on)  { if (m_source) m_source->setIdleEmit(on);   }
 
 private:
     std::unique_ptr<XInputSource> m_source;

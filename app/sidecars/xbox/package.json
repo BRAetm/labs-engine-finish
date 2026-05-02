@@ -1,0 +1,21 @@
+{
+  "name": "xbox-sidecar",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Hidden Electron sidecar running xbox-xcloud-player. Streams frames to LabsEngine via IPC (v2) — spike phase dumps one frame to disk to validate the WebRTC + auth path.",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "spike": "electron . --enable-logging",
+    "auth": "node ./auth.js",
+    "auth:show": "node ./auth.js show"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "xal-node": "^1.1.5",
+    "xbox-xcloud-player": "1.0.0-beta7"
+  },
+  "devDependencies": {
+    "electron": "^32.2.7"
+  }
+}

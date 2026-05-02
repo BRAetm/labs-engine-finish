@@ -22,9 +22,10 @@ CvPythonPlugin::~CvPythonPlugin()
 void CvPythonPlugin::initialize(const PluginContext& ctx)
 {
     m_settings = ctx.settings;
-    if (m_settings) {
-        m_sessionId = m_settings->value(QStringLiteral("cv/sessionId"), 1).toInt();
-    }
+    // No more cv/sessionId global — each Frame carries its own sessionId,
+    // stamped by the source plugin (PS Remote Play=1, xbox_stream=100..107).
+    // The settings key is intentionally not read so a stale value doesn't
+    // get re-saved during this run.
 }
 
 void CvPythonPlugin::shutdown()
@@ -37,7 +38,50 @@ void CvPythonPlugin::shutdown()
 void CvPythonPlugin::pushFrame(const Frame& frame)
 {
     if (!m_running) return;
-    m_frameShm.write(frame);
+
+    const int sid = frame.sessionId;
+    FrameShmWriter* writer = nullptr;
+    {
+        QMutexLocker lock(&m_writersMx);
+        auto it = m_frameShmBySession.find(sid);
+        if (it == m_frameShmBySession.end()) {
+            // First frame for this session — open a per-session SHM block at
+            // Labs_<pid>_Frame_<sid>. Done under the lock so two concurrent
+            // first-frame pushes (e.g. PS + xbox session 0 starting at the
+            // same instant) don't both try to open the same block.
+            auto w = std::make_unique<FrameShmWriter>();
+            const quint32 pid = ::GetCurrentProcessId();
+            if (!w->open(pid, sid)) {
+                qWarning() << "CvPython: frame SHM open failed for session" << sid;
+                return;
+            }
+            qInfo() << "CvPython: opened SHM for session" << sid
+                    << "block=" << w->blockName()
+                    << "pid="   << pid;
+            auto inserted = m_frameShmBySession.emplace(sid, std::move(w));
+            it = inserted.first;
+        }
+        writer = it->second.get();
+    }
+    writer->write(frame);
+
+    if (!m_loggedFirstFrame) {
+        qInfo() << "CvPython: first frame published"
+                << frame.width << "x" << frame.height
+                << "session=" << sid;
+        m_loggedFirstFrame = true;
+    }
+}
+
+void CvPythonPlugin::closeSession(int sessionId)
+{
+    QMutexLocker lock(&m_writersMx);
+    auto it = m_frameShmBySession.find(sessionId);
+    if (it == m_frameShmBySession.end()) return;
+    qInfo() << "CvPython: closing SHM for session" << sessionId
+            << "block=" << it->second->blockName();
+    it->second->close();
+    m_frameShmBySession.erase(it);
 }
 
 // ── IControllerSource ───────────────────────────────────────────────────────
@@ -52,12 +96,10 @@ bool CvPythonPlugin::start()
 {
     if (m_running) return true;
 
+    // No SHM open here anymore — frames open their own block lazily on first
+    // push (per-session). All we need at startup is the gamepad reader so
+    // any already-running script can drive the controller.
     const quint32 pid = ::GetCurrentProcessId();
-    if (!m_frameShm.open(pid, m_sessionId)) {
-        qWarning() << "CvPython: frame SHM open failed";
-        return false;
-    }
-
     m_gamepadReader->configure(pid);
     m_gamepadReader->start();
 
@@ -76,41 +118,16 @@ void CvPythonPlugin::stop()
         m_gamepadReader->requestStop();
         m_gamepadReader->wait(500);
     }
-    m_frameShm.close();
+
+    // Close every per-session SHM writer we ever opened.
+    QMutexLocker lock(&m_writersMx);
+    for (auto& [sid, writer] : m_frameShmBySession) {
+        if (writer) writer->close();
+    }
+    m_frameShmBySession.clear();
 }
 
 // ── Python subprocess ───────────────────────────────────────────────────────
-
-void CvPythonPlugin::launchPython()
-{
-    if (!m_settings) return;
-    const QString scriptPath = m_settings->value(QStringLiteral("cv/scriptPath")).toString();
-    if (scriptPath.isEmpty() || !QFileInfo::exists(scriptPath)) {
-        qInfo() << "CvPython: no script configured (cv/scriptPath). Frames flow to SHM; attach Python manually with --labs-pid"
-                << ::GetCurrentProcessId() << "--session" << m_sessionId;
-        return;
-    }
-    QString python = m_settings->value(QStringLiteral("cv/pythonPath"), QStringLiteral("python")).toString();
-
-    m_process = new QProcess(this);
-    m_process->setProgram(python);
-    m_process->setArguments({
-        scriptPath,
-        QStringLiteral("--labs-pid"), QString::number(::GetCurrentProcessId()),
-        QStringLiteral("--session"),  QString::number(m_sessionId),
-    });
-    m_process->setProcessChannelMode(QProcess::MergedChannels);
-    connect(m_process, &QProcess::readyReadStandardOutput, this, [this]() {
-        if (m_process) qInfo().noquote() << "[py]" << m_process->readAllStandardOutput().trimmed();
-    });
-    m_process->start();
-    if (!m_process->waitForStarted(2000)) {
-        qWarning() << "CvPython: failed to start" << python << scriptPath;
-    } else {
-        qInfo() << "CvPython: launched" << python << scriptPath
-                << "pid=" << m_process->processId();
-    }
-}
 
 void CvPythonPlugin::stopPython()
 {

@@ -40,22 +40,26 @@ protected:
 
 private slots:
     void onModeChanged(int index);
-    void onPickWindow();
     void onPair();
     void onStart();
     void onStop();
     void onFpsTick();
     void onBrowseScript();
+    void onRefreshScripts();
     void onRunScript();
     void onStopScript();
     void onScriptFinished(int exitCode, int exitStatus);
     void onClearLog();
     void onOpenTheme();
 
+    void onXboxWebRunRequested(int sessionId);
+    void onXboxWebStopRequested(int sessionId);
+    void onXboxWebSessionRemoved(int sessionId);
+
 private:
     class FanOutFrameSink;
 
-    enum class Mode { Xbox = 0, PS = 1 };
+    enum class Mode { Xbox = 0, PS = 1, Cloud = 2 };
 
     QWidget* buildTopBar();
     QWidget* buildScriptsRail();
@@ -82,9 +86,39 @@ private:
     IFrameSource*    m_activeSource   = nullptr;
     IControllerSink* m_activeCtrlSink = nullptr;
 
+    // Multi-session Xbox tracking. The plugin is a session factory now;
+    // we track the focused session via its QObject* (engine doesn't link the
+    // plugin DLL, so we can't hold a typed pointer). Cast to IFrameSource* /
+    // IControllerSink* via dynamic_cast — those interfaces live in LabsCore.
+    QPointer<QObject> m_focusedXboxSession;
+    int m_focusedXboxSessionId = -1;
+    void hookXboxStreamSignals();
+    void onXboxSessionAdded(int id);
+    void onXboxSessionRemoved(int id);
+    void onXboxWindowHwndReady(int sessionId, quintptr hwnd);
+    void focusXboxSession(QObject* session);
+
+    // xCloud session container in the center stage. Each session = one
+    // reparented Electron HWND inside its own host widget. Tabs at top to
+    // switch between sessions; one visible at a time.
+    QWidget*        m_xboxContainer  = nullptr;  // outer wrapper inside m_stageHost
+    QWidget*        m_xboxTabStrip   = nullptr;  // horizontal row of QPushButton tabs
+    QStackedWidget* m_xboxStack      = nullptr;  // pages, one per session
+    QMap<int, QWidget*>      m_xboxHosts;        // sessionId → host widget (containing HWND)
+    QMap<int, QPushButton*>  m_xboxTabs;         // sessionId → tab button
+    void buildXboxContainer();
+    void embedXboxHwnd(int sessionId, quintptr hwnd, const QString& label);
+    void removeXboxHost(int sessionId);
+    void showXboxContainer(bool show);
+
+    // Per-xCloud-session script processes. Map keyed by sessionId.
+    QMap<int, QProcess*> m_xboxScriptProcs;
+    void hookXboxWebSignals();
+    void spawnXboxSessionScript(int sessionId);
+    void killXboxSessionScript(int sessionId);
+
     // Top bar controls.
     QComboBox*   m_modeBox    = nullptr;
-    QPushButton* m_btnPick    = nullptr;
     QPushButton* m_btnPair    = nullptr;
     QPushButton* m_btnStart   = nullptr;
     QPushButton* m_btnStop    = nullptr;
@@ -107,12 +141,27 @@ private:
     QStackedWidget*  m_stagePages  = nullptr;
     QLabel*          m_tabVideo    = nullptr;
     QLabel*          m_tabMonitor  = nullptr;
+    QLabel*          m_tabMarket   = nullptr;   // re-added — Marketplace tab in-engine
     ControllerMonitorWidget* m_monitor = nullptr;
     IControllerSource* m_xinputSource = nullptr;   // always-on feed for the monitor
     IControllerSource* m_dualSenseSource = nullptr; // HID-based PS pad source, feeds same fan-out
 
-    // Right rail.
-    QLabel*      m_devicesList = nullptr;
+    // Right rail — Titan Bridge.
+    QLabel*      m_devicesList        = nullptr;
+    QComboBox*   m_titanDeviceCombo   = nullptr;
+    QLabel*      m_titanDeviceStatus  = nullptr;
+    QPushButton* m_titanRestartBtn    = nullptr;
+    QLabel*      m_titanSlots[3]      = {};
+    QComboBox*   m_titanOutputCombo   = nullptr;
+    QLabel*      m_titanUsbLabels[4]  = {};
+
+    // Right rail — Cronus Bridge.
+    QComboBox*   m_cronusDeviceCombo  = nullptr;
+    QLabel*      m_cronusDeviceStatus = nullptr;
+    QPushButton* m_cronusRestartBtn   = nullptr;
+    QLabel*      m_cronusSlots[3]     = {};
+    QComboBox*   m_cronusOutputCombo  = nullptr;
+    QLabel*      m_cronusUsbLabels[4] = {};
 
     // Log strip.
     QPlainTextEdit* m_log = nullptr;

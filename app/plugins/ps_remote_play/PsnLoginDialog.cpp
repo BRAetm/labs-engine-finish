@@ -148,10 +148,10 @@ void PsnLoginDialog::onTokenReply(QNetworkReply* reply)
 
     setStatus(QStringLiteral("Getting account info…"));
 
-    const QByteArray creds = (kClientId + QStringLiteral(":") + kClientSecret).toUtf8().toBase64();
-    QNetworkRequest req{QUrl{kTokenUrl + QStringLiteral("/") +
-                             QString::fromUtf8(QUrl::toPercentEncoding(token))}};
-    req.setRawHeader("Authorization", "Basic " + creds);
+    // Send token in Authorization: Bearer header instead of as a URL path
+    // segment. Path-embedded tokens leak via Qt logging, proxies, crash dumps.
+    QNetworkRequest req{QUrl{kTokenUrl + QStringLiteral("/info")}};
+    req.setRawHeader("Authorization", "Bearer " + token.toUtf8());
 
     QNetworkReply* infoReply = m_nam->get(req);
     connect(infoReply, &QNetworkReply::finished, this, [this, infoReply]() { onInfoReply(infoReply); });

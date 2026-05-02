@@ -23,18 +23,19 @@ target_link_directories(PSRemotePlayPlugin PRIVATE
 target_link_libraries(PSRemotePlayPlugin PRIVATE
     Qt6::Network
     labs
-    avcodec
-    avutil
-    swscale
+    "${FFMPEG_DIR}/lib/libavcodec.dll.a"
+    "${FFMPEG_DIR}/lib/libavutil.dll.a"
+    "${FFMPEG_DIR}/lib/libswscale.dll.a"
 )
 
 # Copy all required runtime DLLs (chiaki + its deps + FFmpeg) next to LabsEngine.exe.
 file(GLOB CHIAKI_DLLS "${CHIAKI_DIR}/build/bin/*.dll")
+file(GLOB VCPKG_DLLS "${CHIAKI_DIR}/build/vcpkg_installed/x64-windows/bin/*.dll")
 file(GLOB FFMPEG_DLLS "${FFMPEG_DIR}/bin/*.dll")
 
 add_custom_command(TARGET PSRemotePlayPlugin POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        ${CHIAKI_DLLS} ${FFMPEG_DLLS}
+        ${CHIAKI_DLLS} ${VCPKG_DLLS} ${FFMPEG_DLLS}
         "$<TARGET_FILE_DIR:LabsEngine>"
     COMMAND_EXPAND_LISTS
 )

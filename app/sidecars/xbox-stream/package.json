@@ -1,0 +1,18 @@
+{
+  "name": "labs-xbox-stream-sidecar",
+  "private": true,
+  "version": "0.2.0",
+  "description": "Headless Greenlight-based Xbox Remote Play / xCloud sidecar. Speaks LBSX framed-pipe protocol over stdio to the Qt XboxStreamPlugin: outbound H.264 NAL chunks + JSON events, inbound JSON commands + gamepad state.",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "xal-node": "^1.1.5",
+    "xbox-xcloud-player": "1.0.0-beta7"
+  },
+  "devDependencies": {
+    "electron": "^32.2.7"
+  }
+}

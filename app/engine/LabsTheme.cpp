@@ -110,7 +110,7 @@ QToolBar::separator { background: %BORDER%; width: 1px; margin: 4px 6px; }
 
 QToolButton, QPushButton {
     background: %SURFACE%; color: %TEXT%;
-    border: 1px solid %BORDER%; border-radius: 6px;
+    border: 1px solid %BORDER%; border-radius: 4px;
     padding: 6px 14px; min-height: 22px; font-weight: 500;
 }
 QToolButton:hover, QPushButton:hover { background: %SURFACEH%; border-color: %BORDERBR%; }
@@ -120,8 +120,8 @@ QToolButton:checked { background: %ACCENTH%; border-color: %ACCENT%; color: %TEX
 
 /* Hero accent — the one button that owns the screen (Start Engine) */
 QPushButton[accent="true"] {
-    background: %ACCENT%; color: white;
-    border: none; border-radius: 8px;
+    background: %ACCENT%; color: #000000;
+    border: none; border-radius: 4px;
     padding: 0 28px; min-height: 38px; font-weight: 700;
     font-size: 13px; letter-spacing: 0.6px;
 }
@@ -131,13 +131,13 @@ QPushButton[accent="true"]:disabled { background: %BGSUB%; color: %TEXTDIM%; }
 
 /* Danger — for stop button when something is running */
 QPushButton[danger="true"] {
-    background: #B91C1C; color: white;
-    border: none; border-radius: 8px;
+    background: transparent; color: #DC2626;
+    border: 1px solid #DC2626; border-radius: 4px;
     padding: 0 28px; min-height: 38px; font-weight: 700;
     font-size: 13px; letter-spacing: 0.6px;
 }
-QPushButton[danger="true"]:hover   { background: #DC2626; }
-QPushButton[danger="true"]:pressed { background: #991B1B; }
+QPushButton[danger="true"]:hover   { background: rgba(220, 38, 38, 0.1); }
+QPushButton[danger="true"]:pressed { background: rgba(220, 38, 38, 0.2); }
 
 /* Ghost — secondary actions (browse, theme, settings) */
 QPushButton[ghost="true"] {
@@ -212,11 +212,24 @@ QWidget#leftRail, QWidget#rightRail {
     background: %BGSUB%;
 }
 QWidget#leftRail  { border-right: 1px solid %BORDER%; }
-QWidget#rightRail { border-left:  1px solid %BORDER%; }
+/* rightRail is always opaque — background image must not show through */
+QWidget#rightRail { border-left: 1px solid %BORDER%; background: %BGSUB%; }
 QWidget#stage     { background: %BG%; }
 QWidget#stageTabs {
     background: %BGSUB%;
     border-bottom: 1px solid %BORDER%;
+}
+
+QFrame#panel {
+    background: %BGSUB%;
+    border: 1px solid %BORDER%;
+    border-radius: 4px;
+}
+QFrame#panelHeader {
+    background: %SURFACE%;
+    border-bottom: 1px solid %BORDER%;
+    border-top-left-radius: 4px;
+    border-top-right-radius: 4px;
 }
 
 QLabel#wordmark {
@@ -254,7 +267,7 @@ QLabel#statePill {
     color: %TEXTMUTED%;
     letter-spacing: 0;
 }
-QLabel#statePill[state="running"] { color: #4ADE80; }
+QLabel#statePill[state="running"] { color: #00E5FF; }
 QLabel#statePill[state="error"]   { color: #FCA5A5; }
 
 /* Big stat numbers (FPS, shots fired) */
@@ -288,7 +301,7 @@ QLabel#pathBlue {
     background: transparent;
 }
 QLabel#tabActive {
-    color: %TEXT%;
+    color: %ACCENT%;
     font-weight: 600;
     padding: 10px 16px;
     border-bottom: 2px solid %ACCENT%;
@@ -329,7 +342,7 @@ QLabel#modeLabel, QLabel#logLabel {
     background: transparent;
 }
 QPlainTextEdit#logStrip {
-    background: #0A0D14;
+    background: %BGSUB%;
     border-top: 1px solid %BORDER%;
     color: #C8D1E0;
     font-family: "Cascadia Mono","Consolas";
@@ -342,6 +355,122 @@ QPlainTextEdit#logStrip:focus { border-top-color: %ACCENT%; }
 QFrame#hrSep {
     color: %BORDER%;
     background: %BORDER%;
+}
+
+/* ── Titan Bridge / right-rail components ───────────────────────────────── */
+
+QGroupBox {
+    background: %BGSUB%;
+    color: %TEXTMUTED%;
+    border: 1px solid %BORDER%;
+    border-radius: 6px;
+    margin-top: 10px;
+    padding-top: 6px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.3px;
+}
+QGroupBox::title {
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    left: 10px;
+    top: 0px;
+    padding: 0 4px;
+    background: %BGSUB%;
+    color: %TEXTMUTED%;
+}
+
+/* Memory slot rows */
+QFrame#titanSlotActive {
+    background: %SURFACE%;
+    border: 1px solid %BORDERBR%;
+    border-radius: 4px;
+}
+QFrame#titanSlot {
+    background: %BGSUB%;
+    border: 1px solid %BORDER%;
+    border-radius: 4px;
+}
+QLabel#titanSlotNumActive {
+    color: %TEXT%;
+    font-weight: 700;
+    font-size: 13px;
+    background: transparent;
+}
+QLabel#titanSlotNum {
+    color: %TEXTDIM%;
+    font-weight: 700;
+    font-size: 13px;
+    background: transparent;
+}
+QLabel#titanSlotLabelActive {
+    color: %TEXTMUTED%;
+    font-size: 12px;
+    background: transparent;
+}
+QLabel#titanSlotLabel {
+    color: %TEXTDIM%;
+    font-size: 12px;
+    background: transparent;
+}
+QLabel#titanStatus {
+    color: %TEXTDIM%;
+    font-size: 11px;
+    background: transparent;
+}
+QFrame#titanIndicator {
+    background: %SURFACE%;
+    border: 1px solid %BORDER%;
+    border-radius: 3px;
+}
+
+/* Force neutral text in the right rail regardless of theme accent/text color */
+QWidget#rightRail QLabel          { color: #c8c8c8; }
+QWidget#rightRail QGroupBox       { color: #666666; }
+QWidget#rightRail QGroupBox::title{ color: #666666; background: %BGSUB%; }
+QWidget#rightRail QPushButton      { color: #c8c8c8; }
+QWidget#rightRail QPushButton:disabled {
+    color: #444444;
+    background: transparent;
+    border: 1px solid #2a2a2a;
+}
+QWidget#rightRail QComboBox            { color: #c8c8c8; min-width: 0; }
+QWidget#rightRail QComboBox:disabled   { color: #555555; }
+QWidget#rightRail QComboBox::drop-down { subcontrol-origin: padding; subcontrol-position: right center; width: 20px; border: none; }
+QWidget#rightRail QComboBox::down-arrow { image: url(:/labs/icon_chevron_down.svg); width: 10px; height: 10px; }
+QLabel#titanStatus                 { color: #555555; }
+QLabel#titanSlotLabel              { color: #3a3a3a; }
+QLabel#titanSlotNum                { color: #3a3a3a; font-weight: 700; }
+QLabel#titanSlotLabelActive        { color: #999999; }
+QLabel#titanSlotNumActive          { color: #e0e0e0; font-weight: 700; }
+
+QTabWidget::pane {
+    border: none;
+    background: %BG%;
+}
+QTabWidget::tab-bar {
+    alignment: left;
+}
+QTabBar {
+    background: %BG%;
+}
+QTabBar::tab {
+    background: %BG%;
+    color: %TEXTDIM%;
+    border: none;
+    border-bottom: 2px solid transparent;
+    padding: 6px 14px;
+    font-size: 12px;
+    font-weight: 500;
+}
+QTabBar::tab:selected {
+    color: %ACCENT%;
+    border-bottom: 2px solid %ACCENT%;
+    background: %BG%;
+}
+QTabBar::tab:hover:!selected {
+    color: %TEXTMUTED%;
+    background: %BGSUB%;
 }
 )")
         .replace("%BG%",        bg)

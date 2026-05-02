@@ -4,10 +4,12 @@
 
 #include <QByteArray>
 #include <QCheckBox>
+#include <QCoreApplication>
 #include <QFrame>
 #include <QLabel>
 #include <QLineEdit>
 #include <QMetaObject>
+#include <QPointer>
 #include <QPushButton>
 #include <QRegularExpression>
 #include <QRegularExpressionValidator>
@@ -51,6 +53,13 @@ static QString buildAuthUrl()
 
 // ── native impl ──────────────────────────────────────────────────────────────
 
+// Heap-allocated Holder: outlives the dialog so the regist trampoline can
+// always dereference user-data safely. The QPointer goes null when the
+// dialog is destroyed; the queued invoke then becomes a no-op.
+struct PairPSDialog::Holder {
+    QPointer<PairPSDialog> dlg;
+};
+
 struct PairPSDialog::Impl {
     LabsLog    log {};
     LabsRegist regist {};
@@ -62,12 +71,16 @@ struct PairPSDialog::Impl {
     static void logCb(LabsLogLevel, const char* msg, void* user) {
         auto* impl = static_cast<Impl*>(user);
         qInfo().noquote() << "[regist]" << msg;
-        if (impl && impl->owner) {
-            const QString m = QString::fromUtf8(msg);
-            QMetaObject::invokeMethod(impl->owner, [impl, m]() {
-                impl->owner->translateRegistMessage(m);
-            }, Qt::QueuedConnection);
-        }
+        if (!impl) return;
+        // Marshal to UI thread via owner pointer captured by value; the
+        // QPointer guard happens on the UI side via a queued lambda that
+        // re-checks owner liveness through a Qt object handle.
+        QPointer<PairPSDialog> ownerPtr = impl->owner;
+        const QString m = QString::fromUtf8(msg);
+        QMetaObject::invokeMethod(qApp, [ownerPtr, m]() {
+            if (!ownerPtr) return;
+            ownerPtr->translateRegistMessage(m);
+        }, Qt::QueuedConnection);
     }
 };
 
@@ -77,8 +90,10 @@ PairPSDialog::PairPSDialog(SettingsManager* settings, QWidget* parent)
     : QDialog(parent)
     , m_settings(settings)
     , m_impl(new Impl())
+    , m_holder(new Holder{})
 {
     m_impl->owner = this;
+    m_holder->dlg = this;
     setWindowTitle(QStringLiteral("Pair PlayStation"));
     setModal(true);
     setMinimumWidth(520);
@@ -202,13 +217,22 @@ PairPSDialog::PairPSDialog(SettingsManager* settings, QWidget* parent)
 
 PairPSDialog::~PairPSDialog()
 {
+    // Null the QPointer first so any queued/in-flight trampoline becomes a no-op.
+    if (m_holder) m_holder->dlg.clear();
+
     if (m_impl) {
         if (m_impl->registInited) {
             labs_regist_stop(&m_impl->regist);
-            labs_regist_fini(&m_impl->regist);
+            labs_regist_fini(&m_impl->regist);  // joins regist thread
         }
+        m_impl->owner = nullptr;
         delete m_impl;
+        m_impl = nullptr;
     }
+    // Safe to delete Holder now: regist thread has joined inside fini, so no
+    // further trampoline calls can land on this Holder.
+    delete m_holder;
+    m_holder = nullptr;
 }
 
 // ── Step 1: OAuth ─────────────────────────────────────────────────────────────
@@ -334,6 +358,10 @@ void PairPSDialog::onPairClicked()
 
     if (host.isEmpty()) { reportStatus(QStringLiteral("Enter the console's IP address."), false, true); return; }
 
+    // Capture host once on the UI thread; used by handleRegistEvent which is
+    // invoked from chiaki's regist thread via the trampoline.
+    m_pairingHost = host;
+
     m_impl->psnBytes = QByteArray::fromBase64(m_accountIdBase64.toLatin1());
     if (m_impl->psnBytes.size() != LABS_PSN_ACCOUNT_ID_SIZE) {
         reportStatus(QStringLiteral("Saved account ID is corrupt — re-link your PSN account."), false, true);
@@ -366,22 +394,35 @@ void PairPSDialog::onPairClicked()
 
     m_registRunning.store(true);
 
+    // Trampoline: runs on chiaki's regist thread. Decode the event into POD
+    // copies synchronously (chiaki may invalidate `event` after return), then
+    // marshal to the UI thread via a QPointer-guarded queued invoke. The
+    // user-data is the heap Holder, NOT the dialog — so even if the dialog
+    // has been destroyed, the Holder is still valid (freed only after
+    // labs_regist_fini joins the regist thread in ~PairPSDialog).
     static auto trampoline = [](LabsRegistEvent* event, void* user) {
-        auto* self = static_cast<PairPSDialog*>(user);
-        if (!self || !event) return;
+        auto* h = static_cast<Holder*>(user);
+        if (!h || !event) return;
+        const int typeInt = static_cast<int>(event->type);
         QByteArray registKey, morning;
         bool isPs5 = true;
         if (event->type == LABS_REGIST_EVENT_TYPE_FINISHED_SUCCESS && event->registered_host) {
-            const LabsRegisteredHost* h = event->registered_host;
-            registKey = QByteArray(h->rp_regist_key, LABS_SESSION_AUTH_SIZE);
-            morning   = QByteArray(reinterpret_cast<const char*>(h->rp_key), 0x10);
-            isPs5     = (h->target == LABS_TARGET_PS5_1) || (h->target == LABS_TARGET_PS5_UNKNOWN);
+            const LabsRegisteredHost* rh = event->registered_host;
+            registKey = QByteArray(rh->rp_regist_key, LABS_SESSION_AUTH_SIZE);
+            morning   = QByteArray(reinterpret_cast<const char*>(rh->rp_key), 0x10);
+            isPs5     = (rh->target == LABS_TARGET_PS5_1) || (rh->target == LABS_TARGET_PS5_UNKNOWN);
         }
-        self->handleRegistEvent(static_cast<int>(event->type), registKey, morning, isPs5);
+        QPointer<PairPSDialog> dlg = h->dlg;
+        QMetaObject::invokeMethod(qApp,
+            [dlg, typeInt, registKey, morning, isPs5]() {
+                if (!dlg) return;
+                dlg->handleRegistEvent(typeInt, registKey, morning, isPs5);
+            },
+            Qt::QueuedConnection);
     };
 
     const LabsErrorCode rc = labs_regist_start(&m_impl->regist, &m_impl->log, &info,
-        static_cast<LabsRegistCb>(+trampoline), this);
+        static_cast<LabsRegistCb>(+trampoline), m_holder);
     if (rc != LABS_ERR_SUCCESS) {
         m_registRunning.store(false);
         reportStatus(QStringLiteral("labs_regist_start failed (%1)").arg(static_cast<int>(rc)), false, true);
@@ -404,7 +445,10 @@ void PairPSDialog::handleRegistEvent(int typeInt, const QByteArray& registKey,
                                      const QByteArray& morning, bool isPs5)
 {
     const auto type = static_cast<LabsRegistEventType>(typeInt);
-    const QString host = m_hostEdit->text().trimmed();
+    // m_pairingHost was captured on the UI thread in onPairClicked. Reading
+    // m_hostEdit->text() here is unsafe since this method is now invoked from
+    // a queued lambda originating on chiaki's regist thread.
+    const QString host = m_pairingHost;
 
     if (type == LABS_REGIST_EVENT_TYPE_FINISHED_SUCCESS) {
         QMetaObject::invokeMethod(this, [this, registKey, morning, isPs5, host]() {

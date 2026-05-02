@@ -26,17 +26,24 @@ enum ControllerButton : quint16 {
     ButtonY             = 0x8000,
 };
 
+enum class ControllerKind : quint8 {
+    None        = 0,
+    Xbox        = 1,
+    PlayStation = 2,
+};
+
 struct LABSCORE_API ControllerState {
-    quint16 buttons       = 0;
-    quint8  leftTrigger   = 0;
-    quint8  rightTrigger  = 0;
-    qint16  leftThumbX    = 0;
-    qint16  leftThumbY    = 0;
-    qint16  rightThumbX   = 0;
-    qint16  rightThumbY   = 0;
-    qint64  timestampUs   = 0;
-    int     slot          = 0;  // 0..3 for XInput slot; 0 for most uses
-    bool    connected     = false;
+    quint16        buttons       = 0;
+    quint8         leftTrigger   = 0;
+    quint8         rightTrigger  = 0;
+    qint16         leftThumbX    = 0;
+    qint16         leftThumbY    = 0;
+    qint16         rightThumbX   = 0;
+    qint16         rightThumbY   = 0;
+    qint64         timestampUs   = 0;
+    int            slot          = 0;  // 0..3 for XInput slot; 0 for most uses
+    bool           connected     = false;
+    ControllerKind kind          = ControllerKind::None;
 };
 
 class LABSCORE_API IControllerSink {

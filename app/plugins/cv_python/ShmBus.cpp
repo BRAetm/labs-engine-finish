@@ -3,6 +3,7 @@
 #include <QDateTime>
 #include <QDebug>
 
+#include <atomic>
 #include <cstring>
 
 namespace Labs {
@@ -69,6 +70,8 @@ bool FrameShmWriter::open(quint32 writerPid, qint32 sessionId)
     storeU32(m_view, 12, 0);         // sequence
     storeU32(m_view, 16, 0);         // payload_size (until first frame)
     storeI32(m_view, 36, sessionId);
+    // epoch_ms — process-startup tag so stale readers detect a writer restart.
+    storeI64(m_view, 48, QDateTime::currentMSecsSinceEpoch());
     return true;
 }
 
@@ -88,10 +91,17 @@ bool FrameShmWriter::write(const Frame& frame)
     const int payloadBytes = frame.stride * frame.height;
     if (payloadBytes > kMaxPayload) return false;
 
-    // Write payload first.
+    // Seqlock: bump sequence to odd ("write in progress"), publish payload +
+    // metadata, fence, then bump to even ("frame ready"). Readers retry while
+    // sequence is odd or changed across the read.
+    const quint32 startSeq = m_sequence + 1;        // odd
+    storeU32(m_view, 12, startSeq);
+    std::atomic_thread_fence(std::memory_order_release);
+
+    // Write payload.
     std::memcpy(m_view + kHeaderSize, frame.data.constData(), payloadBytes);
 
-    // Then header fields.
+    // Write metadata.
     storeU32(m_view, 16, static_cast<quint32>(payloadBytes));
     storeU32(m_view, 20, static_cast<quint32>(frame.width));
     storeU32(m_view, 24, static_cast<quint32>(frame.height));
@@ -99,8 +109,8 @@ bool FrameShmWriter::write(const Frame& frame)
     storeU32(m_view, 32, 0);   // format: 0 = BGRA
     storeI64(m_view, 40, frame.timestampUs / 1000);
 
-    // Sequence last — this is the "publish" signal for readers.
-    ++m_sequence;
+    std::atomic_thread_fence(std::memory_order_release);
+    m_sequence = startSeq + 1;                      // even
     storeU32(m_view, 12, m_sequence);
 
     if (m_event) ::SetEvent(m_event);

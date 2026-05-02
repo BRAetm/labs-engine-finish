@@ -1,8 +1,9 @@
 #include "WgcSource.h"
 #include "SettingsManager.h"
+#include "FrameBufferPool.h"
 
-#include <QDateTime>
 #include <QDebug>
+#include <QString>
 
 #include <d3d11.h>
 #include <dxgi1_2.h>
@@ -23,6 +24,8 @@ namespace wgx  = winrt::Windows::Graphics;
 namespace wgdx = winrt::Windows::Graphics::DirectX;
 namespace wgc  = winrt::Windows::Graphics::Capture;
 
+static constexpr size_t kMaxFramePayload = 1920ull * 1080 * 4;
+
 namespace Labs {
 
 struct WgcSource::Impl {
@@ -34,7 +37,11 @@ struct WgcSource::Impl {
     wgc::Direct3D11CaptureFramePool framePool { nullptr };
     wgc::GraphicsCaptureSession     session { nullptr };
 
-    winrt::event_token frameArrivedToken {};
+    wgc::Direct3D11CaptureFramePool::FrameArrived_revoker frameArrivedRevoker {};
+
+    ComPtr<ID3D11Texture2D> staging;
+    int stagingW = 0;
+    int stagingH = 0;
 
     bool initD3D()
     {
@@ -170,10 +177,11 @@ bool WgcSource::start()
 
     const auto size = m_impl->item.Size();
     auto device = m_impl->winrtDevice.as<wgdx::Direct3D11::IDirect3DDevice>();
+    // 4 buffers — 2 was too tight for fan-out (display + SHM + CV)
     m_impl->framePool = wgc::Direct3D11CaptureFramePool::Create(device,
-        wgdx::DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, size);
+        wgdx::DirectXPixelFormat::B8G8R8A8UIntNormalized, 4, size);
 
-    m_impl->frameArrivedToken = m_impl->framePool.FrameArrived(
+    m_impl->frameArrivedRevoker = m_impl->framePool.FrameArrived(winrt::auto_revoke,
         [this](wgc::Direct3D11CaptureFramePool const& pool, auto&&) {
             auto frame = pool.TryGetNextFrame();
             if (!frame || !m_sink) return;
@@ -186,31 +194,65 @@ bool WgcSource::start()
             D3D11_TEXTURE2D_DESC desc {};
             tex->GetDesc(&desc);
 
-            D3D11_TEXTURE2D_DESC stagingDesc = desc;
-            stagingDesc.Usage = D3D11_USAGE_STAGING;
-            stagingDesc.BindFlags = 0;
-            stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-            stagingDesc.MiscFlags = 0;
-
-            ComPtr<ID3D11Texture2D> staging;
-            if (FAILED(m_impl->d3dDevice->CreateTexture2D(&stagingDesc, nullptr, &staging))) return;
-            m_impl->d3dContext->CopyResource(staging.Get(), tex.get());
+            // Persistent staging texture — recreate only on size change.
+            if (!m_impl->staging
+                || int(desc.Width)  != m_impl->stagingW
+                || int(desc.Height) != m_impl->stagingH) {
+                D3D11_TEXTURE2D_DESC stagingDesc = desc;
+                stagingDesc.Usage = D3D11_USAGE_STAGING;
+                stagingDesc.BindFlags = 0;
+                stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                stagingDesc.MiscFlags = 0;
+                m_impl->staging.Reset();
+                if (FAILED(m_impl->d3dDevice->CreateTexture2D(&stagingDesc, nullptr, &m_impl->staging))) return;
+                m_impl->stagingW = int(desc.Width);
+                m_impl->stagingH = int(desc.Height);
+            }
+            m_impl->d3dContext->CopyResource(m_impl->staging.Get(), tex.get());
 
             D3D11_MAPPED_SUBRESOURCE m {};
-            if (FAILED(m_impl->d3dContext->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &m))) return;
+            if (FAILED(m_impl->d3dContext->Map(m_impl->staging.Get(), 0, D3D11_MAP_READ, 0, &m))) return;
+
+            // Strip DXGI row-pitch padding so downstream (SHM, CV) sees a tight buffer.
+            const int frameWidth  = int(desc.Width);
+            const int frameHeight = int(desc.Height);
+            const int bpp = 4;
+            const size_t rowBytes = static_cast<size_t>(frameWidth) * bpp;
+            const size_t total    = rowBytes * static_cast<size_t>(frameHeight);
+            if (total > kMaxFramePayload) {
+                static bool warned = false;
+                if (!warned) {
+                    qWarning() << "[WGC] dropping frame: total bytes" << total << "exceeds SHM cap" << kMaxFramePayload;
+                    warned = true;
+                }
+                m_impl->d3dContext->Unmap(m_impl->staging.Get(), 0);
+                return;
+            }
+
+            // Pool-backed buffer — zero per-frame heap allocations on the
+            // hot path. The shared_ptr stashed on the Frame keeps the
+            // pool slot alive for the whole fan-out lifetime; when the
+            // last consumer drops the Frame, the slot returns automatically.
+            auto slot = FrameBufferPool::global().acquire(total);
+            auto* dst = reinterpret_cast<uint8_t*>(slot->data);
+            const auto* src = static_cast<const uint8_t*>(m.pData);
+            for (int y = 0; y < frameHeight; ++y) {
+                std::memcpy(dst + size_t(y) * rowBytes, src + size_t(y) * m.RowPitch, rowBytes);
+            }
 
             Frame out;
-            out.width  = int(desc.Width);
-            out.height = int(desc.Height);
-            out.stride = int(m.RowPitch);
+            out.width  = frameWidth;
+            out.height = frameHeight;
+            out.stride = int(rowBytes);
             out.format = PixelFormat::BGRA8;
-            out.timestampUs = QDateTime::currentMSecsSinceEpoch() * 1000;
-            out.data = QByteArray(reinterpret_cast<const char*>(m.pData),
-                                  int(m.RowPitch) * int(desc.Height));
+            out.timestampUs = frame.SystemRelativeTime().count() / 10; // 100ns ticks → microseconds
+            out.data = QByteArray::fromRawData(slot->data, int(total));
+            out._pool_holder = slot;
 
-            m_impl->d3dContext->Unmap(staging.Get(), 0);
+            m_impl->d3dContext->Unmap(m_impl->staging.Get(), 0);
 
             m_frameCount.fetch_add(1, std::memory_order_relaxed);
+
             if (m_sink) m_sink->pushFrame(out);
         });
 
@@ -226,13 +268,17 @@ bool WgcSource::start()
 void WgcSource::stop()
 {
     if (!m_running.exchange(false)) return;
+    // Revoke first so no late callback lands on dead D3D/framePool state.
+    m_impl->frameArrivedRevoker.revoke();
     if (m_impl->session)   { m_impl->session.Close();   m_impl->session   = nullptr; }
     if (m_impl->framePool) {
-        if (m_impl->frameArrivedToken) m_impl->framePool.FrameArrived(m_impl->frameArrivedToken);
         m_impl->framePool.Close();
         m_impl->framePool = nullptr;
     }
     m_impl->item = nullptr;
+    m_impl->staging.Reset();
+    m_impl->stagingW = 0;
+    m_impl->stagingH = 0;
 }
 
 } // namespace Labs

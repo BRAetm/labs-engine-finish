@@ -6,6 +6,8 @@
 #include <QString>
 #include <QtGlobal>
 
+#include <memory>
+
 namespace Labs {
 
 enum class PixelFormat : int {
@@ -21,6 +23,19 @@ struct LABSCORE_API Frame {
     int         stride = 0;    // bytes per row
     PixelFormat format = PixelFormat::Unknown;
     qint64      timestampUs = 0;
+    // Source-stamped session id. Routes the frame to the right SHM block in
+    // CvPythonPlugin so external scripts spawned per-session see only their
+    // session's pixels. Convention:
+    //   0       = unknown / no-session (fallback)
+    //   1       = PS Remote Play (preserves --session 1 used by Labs2K, xDrive3K)
+    //   100..107= xbox_stream session 0..7 (m_info.id + 100, dodges PS namespace)
+    int         sessionId = 0;
+    // Optional pool-buffer keep-alive. Sources that build `data` via
+    // `QByteArray::fromRawData(slot->data, ...)` MUST also stash the
+    // pool slot's shared_ptr here; copying the Frame bumps the refcount,
+    // and the slot returns to FrameBufferPool when the last copy dies.
+    // Default-constructed (nullptr) for any non-pooled allocation.
+    std::shared_ptr<void> _pool_holder;
 
     bool isValid() const {
         return width > 0 && height > 0 && stride >= width * 4

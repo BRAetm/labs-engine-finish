@@ -37,3 +37,17 @@ __pycache__/
 # User-local settings
 labs-engine/scripts/userdata/
 labs-engine/userdata/
+
+# Vendored third-party SDKs / clones — not source we author, downloaded
+# by setup scripts (dl_webview2.ps1) or git clone. Don't bloat the repo.
+app/third-party/greenlight/
+app/third-party/webview2/
+
+# Node sidecar build state — package.json + source files commit, but the
+# 200MB+ of installed deps don't.
+app/sidecars/*/node_modules/
+
+# Runtime settings written by the running app
+xdrive_settings.json
+.claude/scheduled_tasks.lock
+labs-engine/.claude/

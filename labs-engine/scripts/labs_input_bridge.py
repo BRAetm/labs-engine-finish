@@ -44,14 +44,17 @@ def _now_qpc() -> int:
 # ── SHM layout ────────────────────────────────────────────────────────────────
 _SHM_NAME = "Labs_Input_Override_v2"
 _SIZE     = 32
-# little-endian packed: magic, expires, rt, l2, flags, rs_y, ls_y, buttons, reserved
-_FMT      = "<4sQBBBhhH11s"
+# little-endian packed: magic, expires, rt, l2, flags, rs_y, ls_y, buttons,
+# rs_x, ls_x, reserved. Matches InputOverrideRecord in app/core/InputOverride.h.
+_FMT      = "<4sQBBBhhHhh7s"
 
 _FLAG_RT   = 0x01
 _FLAG_L2   = 0x02
 _FLAG_RSY  = 0x04
 _FLAG_LSY  = 0x08
 _FLAG_BTNS = 0x10
+_FLAG_RSX  = 0x20
+_FLAG_LSX  = 0x40
 
 # ControllerButton bits — match app/core/InputTypes.h
 BTN_DPAD_UP    = 0x0001
@@ -84,7 +87,7 @@ def _ensure_mm():
 
 def _zero_shm(mm):
     mm.seek(0)
-    mm.write(struct.pack(_FMT, b"LBSO", 0, 0, 0, 0, 0, 0, 0, b"\x00" * 11))
+    mm.write(struct.pack(_FMT, b"LBSO", 0, 0, 0, 0, 0, 0, 0, 0, 0, b"\x00" * 7))
 
 
 # Eager init: open and zero the SHM at module import. Earlier we did this
@@ -121,7 +124,8 @@ for _sig in (getattr(_signal, "SIGTERM", None),
 
 
 def _write(rt: int, l2: int, flags: int, rs_y: int, ls_y: int,
-           duration_ms: int, buttons: int = 0):
+           duration_ms: int, buttons: int = 0,
+           rs_x: int = 0, ls_x: int = 0):
     mm = _ensure_mm()
     expires = _now_qpc() + duration_ms * _QPC_PER_MS
     mm.seek(0)
@@ -130,7 +134,9 @@ def _write(rt: int, l2: int, flags: int, rs_y: int, ls_y: int,
                          max(-32767, min(32767, int(rs_y))),
                          max(-32767, min(32767, int(ls_y))),
                          int(buttons) & 0xFFFF,
-                         b"\x00" * 11))
+                         max(-32767, min(32767, int(rs_x))),
+                         max(-32767, min(32767, int(ls_x))),
+                         b"\x00" * 7))
 
 
 def set_rt_pulse(value: int = 255, duration_ms: int = 30):
@@ -144,6 +150,17 @@ def set_l2_pulse(value: int = 255, duration_ms: int = 30):
 def set_rs_y(value: int = 0, duration_ms: int = 80):
     """Override right-stick Y. value=0 RELEASES the stick (shot-stick fire)."""
     _write(0, 0, _FLAG_RSY, value, 0, duration_ms)
+
+
+def set_rs_x(value: int = 0, duration_ms: int = 80):
+    """Override right-stick X. value=0 RELEASES the stick toward neutral."""
+    _write(0, 0, _FLAG_RSX, 0, 0, duration_ms, rs_x=value)
+
+
+def set_rs_xy(x: int, y: int, duration_ms: int = 80):
+    """Override BOTH right-stick axes simultaneously. Used for multi-direction
+       rhythm shot release — flick opposite of the user's hold vector."""
+    _write(0, 0, _FLAG_RSY | _FLAG_RSX, y, 0, duration_ms, rs_x=x)
 
 
 def set_ls_y(value: int = 0, duration_ms: int = 80):

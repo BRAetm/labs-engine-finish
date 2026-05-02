@@ -11,6 +11,7 @@ extern "C" {
 }
 
 #include <atomic>
+#include <cmath>
 #include <thread>
 #include <vector>
 
@@ -129,13 +130,31 @@ static std::vector<HidProbe> enumPlaystationHids()
 //     [10]   PS/mute/touchpad
 enum class Layout { Ds4Compat, DualSenseFull };
 
-// Windows enumerates both DS4 and DualSense in "DS4 compat" mode by default
-// (report id 0x01, dpad+buttons at [5], triggers at [8..9]). A DualSense only
-// switches to its full 64-byte layout (sticks/triggers first, buttons at [8])
-// after we send a feature report — which we don't. Detect by dpad location:
-// at idle the dpad low nibble == 0x08 (neutral). If that's at byte 5, we're
-// in DS4 compat; if at byte 8, full DualSense.
-static ControllerState mapReport(const BYTE* r, Layout layout)
+// Maximum byte index into `report` that mapReport() touches, given a layout.
+// Used to bound-check after the BT shift so we don't read off the end of buf.
+static constexpr size_t kDs4CompatMaxIdx       = 9;   // l2 at [8], r2 at [9]
+static constexpr size_t kDualSenseFullMaxIdx   = 10;  // extraBits at [10]
+static size_t requiredLen(Layout layout)
+{
+    return (layout == Layout::DualSenseFull ? kDualSenseFullMaxIdx
+                                            : kDs4CompatMaxIdx) + 1;
+}
+
+// PID-keyed layout default. USB vs BT is decided separately by report length
+// and prefix bytes; this just picks the family. Falls back to Ds4Compat for
+// unknown PIDs (shouldn't happen — enum filters by isSupportedPid — but safe).
+static Layout defaultLayoutForPid(USHORT pid)
+{
+    switch (pid) {
+        case kPidDualSense:
+        case kPidDualSenseEdge:    return Layout::DualSenseFull;
+        case kPidDualShock4_v1:
+        case kPidDualShock4_v2:    return Layout::Ds4Compat;
+        default:                   return Layout::Ds4Compat;
+    }
+}
+
+static ControllerState mapReport(const BYTE* r, Layout layout, int slot)
 {
     ControllerState s;
     // Clamp to ±32767 (not -32768) so callers can safely negate the result —
@@ -145,10 +164,19 @@ static ControllerState mapReport(const BYTE* r, Layout layout)
         const int c = (int(v) - 128) * 257;
         return qint16(qBound(-32767, c, 32767));
     };
+    // XInput-standard radial deadzone. Below this, the stick reads "centered"
+    // so DualSense sensor noise / center-drift doesn't bleed into the virtual
+    // X360 pad we expose to xbox.com/play. Numbers match XINPUT_GAMEPAD_*_THUMB_DEADZONE.
+    auto deadzone = [](qint16& x, qint16& y, int dz) {
+        const double mag = std::sqrt(double(x) * x + double(y) * y);
+        if (mag < dz) { x = 0; y = 0; }
+    };
     s.leftThumbX  =  cnv(r[1]);
     s.leftThumbY  = -cnv(r[2]);
     s.rightThumbX =  cnv(r[3]);
     s.rightThumbY = -cnv(r[4]);
+    deadzone(s.leftThumbX,  s.leftThumbY,  7849);
+    deadzone(s.rightThumbX, s.rightThumbY, 8689);
 
     BYTE btnBits, shoulderBits, extraBits;
     BYTE l2, r2;
@@ -197,122 +225,314 @@ static ControllerState mapReport(const BYTE* r, Layout layout)
 
     s.buttons     = buttons;
     s.connected   = true;
-    s.slot        = 0;
+    s.kind        = ControllerKind::PlayStation;
+    s.slot        = slot;
     s.timestampUs = QDateTime::currentMSecsSinceEpoch() * 1000;
     return s;
 }
 
 // ── DualSenseSource impl ─────────────────────────────────────────────────────
 struct DualSenseSource::Impl {
-    DualSenseSource*   owner  = nullptr;
-    std::thread        readerThread;
-    HANDLE             hidHandle = INVALID_HANDLE_VALUE;
-    USHORT             pid = 0;
+    DualSenseSource* owner = nullptr;
 
-    void runReader() {
-        while (owner->m_running.load()) {
-            auto devs = enumPlaystationHids();
-            if (devs.empty()) {
-                // Emit a disconnected tick so any UI reflects "no pad".
-                if (owner->m_sink) {
-                    ControllerState s;
-                    s.connected = false;
-                    s.timestampUs = QDateTime::currentMSecsSinceEpoch() * 1000;
-                    owner->m_sink->pushState(s);
-                }
-                ::Sleep(1000);
-                continue;
-            }
-            const auto d = devs.front();
-            std::wstring wpath = d.path.toStdWString();
-            hidHandle = ::CreateFileW(wpath.c_str(),
-                                      GENERIC_READ | GENERIC_WRITE,
-                                      FILE_SHARE_READ | FILE_SHARE_WRITE,
-                                      nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
-            if (hidHandle == INVALID_HANDLE_VALUE) { ::Sleep(500); continue; }
-            pid = d.pid;
-            qInfo().noquote() << QStringLiteral("[DualSense] connected — pid=0x%1 usage=0x%2 reportLen=%3")
-                                     .arg(d.pid, 4, 16, QLatin1Char('0'))
-                                     .arg(d.usage, 4, 16, QLatin1Char('0'))
-                                     .arg(d.inputReportLen);
+    // Per-device reader. Owns a thread + atomic handle so stop() and the
+    // reader can both safely race to close the HID handle exactly once.
+    struct DeviceCtx {
+        std::thread             thread;
+        std::atomic<HANDLE>     handle{INVALID_HANDLE_VALUE};
+        std::atomic<bool>       active{false};
+        QString                 path;          // path we last attached to
+        USHORT                  pid = 0;
+        int                     slot = 0;
+    };
+    // Up to 2 controllers (slot 0, slot 1). DeviceCtx is non-movable due to
+    // the atomic — use unique_ptr so the vector is fine.
+    std::vector<std::unique_ptr<DeviceCtx>> devices;
 
-            BYTE buf[128] = {0};
-            bool dumpedFirst = false;
-            Layout layout = Layout::Ds4Compat;  // default; auto-detected below
-            OVERLAPPED ov{};
-            ov.hEvent = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
-            while (owner->m_running.load()) {
+    // Atomically take ownership of the handle from `slot.handle`, returning
+    // the prior value. Whoever sees a real (non-INVALID) handle is responsible
+    // for CloseHandle. Anyone else just exits.
+    static HANDLE takeHandle(DeviceCtx& ctx) {
+        return ctx.handle.exchange(INVALID_HANDLE_VALUE,
+                                   std::memory_order_acq_rel);
+    }
+
+    void runReader(DeviceCtx* ctx) {
+        ControllerKind kind = ControllerKind::PlayStation;
+        const Layout pidLayout = defaultLayoutForPid(ctx->pid);
+        Layout layout = pidLayout;
+
+        BYTE buf[128] = {0};
+        OVERLAPPED ov{};
+        ov.hEvent = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        bool readPending = false;
+
+        // First-frame heuristic only as a fallback when PID is unknown.
+        bool needsHeuristic = false;
+        bool dumpedFirst = false;
+
+        while (owner->m_running.load() && ctx->active.load()) {
+            // (Re-)issue ReadFile only when no prior I/O is queued. Reusing
+            // OVERLAPPED while the kernel still owns it is undefined.
+            if (!readPending) {
                 ::ResetEvent(ov.hEvent);
-                DWORD got = 0;
-                BOOL ok = ::ReadFile(hidHandle, buf, sizeof(buf), &got, &ov);
-                if (!ok && ::GetLastError() == ERROR_IO_PENDING) {
-                    DWORD wait = ::WaitForSingleObject(ov.hEvent, 1000);
-                    if (wait != WAIT_OBJECT_0) {
-                        if (!owner->m_running.load()) break;
-                        continue;
+                DWORD got0 = 0;
+                BOOL ok = ::ReadFile(ctx->handle.load(), buf, sizeof(buf), &got0, &ov);
+                if (ok) {
+                    // Synchronous completion. Skip the wait, dispatch directly.
+                    if (got0 == 0) { qInfo() << "[DualSense] disconnected"; break; }
+                    DWORD got = got0;
+                    if (!dispatchReport(ctx, buf, got, pidLayout, layout,
+                                        needsHeuristic, dumpedFirst, kind)) {
+                        // dispatchReport returns false only on hard error; treat
+                        // as disconnect.
+                        break;
                     }
-                    ok = ::GetOverlappedResult(hidHandle, &ov, &got, FALSE);
+                    continue;
                 }
+                if (::GetLastError() != ERROR_IO_PENDING) {
+                    qInfo() << "[DualSense] ReadFile error" << ::GetLastError();
+                    break;
+                }
+                readPending = true;
+            }
+
+            DWORD wait = ::WaitForSingleObject(ov.hEvent, 1000);
+            if (wait == WAIT_OBJECT_0) {
+                DWORD got = 0;
+                BOOL ok = ::GetOverlappedResult(ctx->handle.load(), &ov, &got, FALSE);
+                readPending = false;
                 if (!ok || got == 0) {
                     qInfo() << "[DualSense] disconnected";
                     break;
                 }
-                // USB: buf[0] == 0x01 and bytes line up with our USB layout
-                // (report id at [0], LX at [1]).
-                // BT: DualSense emits report 0x31 (>= 78 bytes), which has one
-                //   "tag" byte between the report id and the USB-equivalent
-                //   payload, so the payload starts at buf[2] and "LX" — which
-                //   our mapping reads at report[1] — must come from buf[2].
-                //   Shift by +1 (not +2) so report[1] == buf[2].
-                // DS4 BT uses report 0x11 with a similar two-byte prefix.
-                const BYTE* report = buf;
-                if (got >= 78 && (buf[0] == 0x31 || buf[0] == 0x11)) {
-                    report = buf + 1;
+                if (!dispatchReport(ctx, buf, got, pidLayout, layout,
+                                    needsHeuristic, dumpedFirst, kind)) {
+                    break;
                 }
-                if (got < 10) continue;
-
-                if (!dumpedFirst) {
-                    dumpedFirst = true;
-                    // Auto-detect layout: dpad-neutral is 0x8 in the low nibble
-                    // of whichever button byte the device uses. Check both
-                    // candidate positions and pick whichever looks neutral at
-                    // the moment of first read (user isn't pressing anything).
-                    const BYTE lo5 = report[5] & 0x0F;
-                    const BYTE lo8 = report[8] & 0x0F;
-                    if (lo8 == 0x8 && lo5 != 0x8) layout = Layout::DualSenseFull;
-                    else                          layout = Layout::Ds4Compat;
-
-                    const int n = qMin(DWORD(16), got);
-                    QString hex;
-                    for (int k = 0; k < n; ++k) hex += QString::asprintf("%02X ", buf[k]);
-                    qInfo().noquote() << QStringLiteral("[DualSense] first report (%1 bytes): %2  → layout=%3")
-                                             .arg(got).arg(hex.trimmed())
-                                             .arg(layout == Layout::DualSenseFull ? "DualSenseFull" : "Ds4Compat");
-                }
-
-                ControllerState s = mapReport(report, layout);
-                // Override application moved to FanOutCtrlSink — see
-                // app/engine/LabsMainWindow.cpp. Doing it per-source loses
-                // the race against XInputSource pushes; doing it at the
-                // fan-out covers every source uniformly.
-                if (owner->m_sink) owner->m_sink->pushState(s);
+                continue;
             }
-            ::CloseHandle(ov.hEvent);
-            ::CloseHandle(hidHandle);
-            hidHandle = INVALID_HANDLE_VALUE;
+            if (wait == WAIT_TIMEOUT) {
+                // I/O is still pending. DO NOT re-issue ReadFile — keep waiting
+                // on the same OVERLAPPED next iteration. If we're shutting
+                // down, cancel and drain it before exiting.
+                if (!owner->m_running.load() || !ctx->active.load()) {
+                    HANDLE h = ctx->handle.load();
+                    if (h != INVALID_HANDLE_VALUE) ::CancelIoEx(h, nullptr);
+                    DWORD got = 0;
+                    if (h != INVALID_HANDLE_VALUE) {
+                        ::GetOverlappedResult(h, &ov, &got, TRUE);
+                    }
+                    readPending = false;
+                    break;
+                }
+                continue;
+            }
+            // WAIT_FAILED or anything else — bail.
+            qInfo() << "[DualSense] WaitForSingleObject failed" << ::GetLastError();
+            break;
+        }
+
+        // If we exited with I/O still queued (e.g. ReadFile error path),
+        // make sure the kernel isn't holding our buffer.
+        if (readPending) {
+            HANDLE h = ctx->handle.load();
+            if (h != INVALID_HANDLE_VALUE) ::CancelIoEx(h, nullptr);
+            DWORD got = 0;
+            if (h != INVALID_HANDLE_VALUE) {
+                ::GetOverlappedResult(h, &ov, &got, TRUE);
+            }
+        }
+
+        ::CloseHandle(ov.hEvent);
+
+        // Reader owns the close: exchange the handle to INVALID and only the
+        // path that grabs the real value calls CloseHandle. stop() does the
+        // same exchange dance so we can't double-close.
+        HANDLE h = takeHandle(*ctx);
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+    }
+
+    // Returns true to keep reading, false on fatal error (caller breaks out).
+    bool dispatchReport(DeviceCtx* ctx, BYTE* buf, DWORD got,
+                        Layout pidLayout, Layout& layout,
+                        bool& needsHeuristic, bool& dumpedFirst,
+                        ControllerKind /*kind*/) {
+        // USB: buf[0] == 0x01 and bytes line up with our USB layout
+        // (report id at [0], LX at [1]).
+        // BT: DualSense emits report 0x31 (>= 78 bytes), which has one
+        //   "tag" byte between the report id and the USB-equivalent
+        //   payload, so the payload starts at buf[2] and "LX" — which
+        //   our mapping reads at report[1] — must come from buf[2].
+        //   Shift by +1 (not +2) so report[1] == buf[2].
+        // DS4 BT uses report 0x11 with a similar two-byte prefix.
+        const BYTE* report = buf;
+        if (got >= 78 && (buf[0] == 0x31 || buf[0] == 0x11)) {
+            report = buf + 1;
+        }
+
+        // Bound the post-shift report by the layout's max read offset.
+        const size_t shift     = static_cast<size_t>(report - buf);
+        const size_t reportLen = (got >= shift) ? (static_cast<size_t>(got) - shift) : 0;
+        if (reportLen < requiredLen(layout)) return true;
+
+        if (!dumpedFirst) {
+            dumpedFirst = true;
+            // PID-keyed default — do not auto-detect from the first frame
+            // unless the PID is unknown. Auto-detect mis-locks if the user
+            // happened to be holding any direction at startup.
+            const bool known = ctx->pid == kPidDualSense
+                            || ctx->pid == kPidDualSenseEdge
+                            || ctx->pid == kPidDualShock4_v1
+                            || ctx->pid == kPidDualShock4_v2;
+            if (known) {
+                layout = pidLayout;
+                needsHeuristic = false;
+            } else {
+                // Fallback: dpad neutral nibble (0x8) tells us where buttons live.
+                const BYTE lo5 = (reportLen > 5) ? (report[5] & 0x0F) : 0xFF;
+                const BYTE lo8 = (reportLen > 8) ? (report[8] & 0x0F) : 0xFF;
+                if (lo8 == 0x8 && lo5 != 0x8) layout = Layout::DualSenseFull;
+                else                          layout = Layout::Ds4Compat;
+                needsHeuristic = true;
+            }
+
+            const int n = qMin(DWORD(16), got);
+            QString hex;
+            for (int k = 0; k < n; ++k) hex += QString::asprintf("%02X ", buf[k]);
+            qInfo().noquote() << QStringLiteral("[DualSense] slot=%1 first report (%2 bytes): %3  → layout=%4 (%5)")
+                                     .arg(ctx->slot).arg(got).arg(hex.trimmed())
+                                     .arg(layout == Layout::DualSenseFull ? "DualSenseFull" : "Ds4Compat")
+                                     .arg(needsHeuristic ? "heuristic" : "PID-keyed");
+
+            // Re-check bound now that the layout may have changed.
+            if (reportLen < requiredLen(layout)) return true;
+        }
+
+        ControllerState s = mapReport(report, layout, ctx->slot);
+        if (owner->m_sink) owner->m_sink->pushState(s);
+        return true;
+    }
+
+    void supervisor() {
+        // Keep up to 2 device contexts alive; reattach on disconnect.
+        while (owner->m_running.load()) {
+            auto devs = enumPlaystationHids();
+            if (devs.empty()) {
+                if (owner->m_sink) {
+                    ControllerState s;
+                    s.connected = false;
+                    s.kind      = ControllerKind::None;
+                    s.timestampUs = QDateTime::currentMSecsSinceEpoch() * 1000;
+                    owner->m_sink->pushState(s);
+                }
+                ::Sleep(250);
+                // Reap any finished reader threads.
+                reapFinished();
+                continue;
+            }
+
+            // Slot 0 and slot 1 — open the first two distinct enumerated
+            // gamepad collections. (Common 2-controller case; we don't open
+            // the entire list to keep this surgical.)
+            const int kMaxSlots = 2;
+            const int wanted = qMin(kMaxSlots, int(devs.size()));
+            for (int slot = 0; slot < wanted; ++slot) {
+                attachIfMissing(devs[slot], slot);
+            }
+            reapFinished();
+            ::Sleep(500);
+        }
+
+        // Shutdown: signal each device, cancel pending I/O, join.
+        for (auto& up : devices) {
+            up->active.store(false);
+            HANDLE h = takeHandle(*up);
+            if (h != INVALID_HANDLE_VALUE) {
+                ::CancelIoEx(h, nullptr);
+                ::CloseHandle(h);
+            }
+        }
+        for (auto& up : devices) {
+            if (up->thread.joinable()) up->thread.join();
+        }
+        devices.clear();
+    }
+
+    void attachIfMissing(const HidProbe& d, int slot) {
+        // If we already have an active reader for this slot+path, leave it.
+        for (auto& up : devices) {
+            if (up->slot == slot && up->active.load() && up->path == d.path) return;
+        }
+        // If something else is in this slot but stale, mark for reaping by
+        // letting it finish naturally. We'll only attach a new one when no
+        // active context occupies that slot.
+        for (auto& up : devices) {
+            if (up->slot == slot && up->active.load()) {
+                // Slot held by a different path/device — don't double-attach.
+                return;
+            }
+        }
+
+        std::wstring wpath = d.path.toStdWString();
+        HANDLE h = ::CreateFileW(wpath.c_str(),
+                                 GENERIC_READ | GENERIC_WRITE,
+                                 FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                 nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
+        if (h == INVALID_HANDLE_VALUE) return;
+
+        auto ctx = std::make_unique<DeviceCtx>();
+        ctx->handle.store(h);
+        ctx->active.store(true);
+        ctx->path = d.path;
+        ctx->pid  = d.pid;
+        ctx->slot = slot;
+        DeviceCtx* raw = ctx.get();
+        ctx->thread = std::thread([this, raw]{
+            runReader(raw);
+            raw->active.store(false);
+        });
+        qInfo().noquote() << QStringLiteral("[DualSense] slot=%1 connected — pid=0x%2 reportLen=%3")
+                                 .arg(slot)
+                                 .arg(d.pid, 4, 16, QLatin1Char('0'))
+                                 .arg(d.inputReportLen);
+        devices.push_back(std::move(ctx));
+    }
+
+    void reapFinished() {
+        for (auto it = devices.begin(); it != devices.end();) {
+            auto& up = *it;
+            if (!up->active.load()) {
+                if (up->thread.joinable()) up->thread.join();
+                it = devices.erase(it);
+            } else {
+                ++it;
+            }
         }
     }
 
+    std::thread supervisorThread;
+
     void start() {
         owner->m_running.store(true);
-        readerThread = std::thread([this]{ runReader(); });
+        supervisorThread = std::thread([this]{ supervisor(); });
     }
 
     void stop() {
         owner->m_running.store(false);
-        if (hidHandle != INVALID_HANDLE_VALUE) ::CancelIoEx(hidHandle, nullptr);
-        if (readerThread.joinable()) readerThread.join();
-        if (hidHandle != INVALID_HANDLE_VALUE) { ::CloseHandle(hidHandle); hidHandle = INVALID_HANDLE_VALUE; }
+        // Pre-emptively unblock all readers: take each handle (reader will
+        // see INVALID and exit; we close it). This is the same exchange
+        // dance the reader does, so only one of us calls CloseHandle.
+        for (auto& up : devices) {
+            up->active.store(false);
+            HANDLE h = takeHandle(*up);
+            if (h != INVALID_HANDLE_VALUE) {
+                ::CancelIoEx(h, nullptr);
+                ::CloseHandle(h);
+            }
+        }
+        if (supervisorThread.joinable()) supervisorThread.join();
+        // supervisor() also joins reader threads; nothing to do here.
     }
 };
 

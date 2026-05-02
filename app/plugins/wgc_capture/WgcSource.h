@@ -3,6 +3,7 @@
 #include "FrameTypes.h"
 
 #include <QObject>
+#include <QString>
 #include <Windows.h>
 #include <atomic>
 #include <memory>
