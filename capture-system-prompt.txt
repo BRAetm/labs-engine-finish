@@ -1,0 +1,38 @@
+# Labs Launcher - Multi-Capture System
+
+Copy into your local Claude:
+
+---
+
+The Labs Launcher needs a plugin-based capture system like Helios. Currently it only has MfCaptureSource (Media Foundation). Add support for:
+
+## Required Capture Plugins
+
+1. **OBSCapture** - Connect to OBS via WebSocket (fastest, GPU-accelerated)
+2. **DSCapture** - DirectShow capture
+3. **MagewellCapture** - Magewell capture card
+
+## Reference Implementation (Helios)
+
+Check the Helios plugins for the API:
+- /tmp/helios-source/plugins/OBSCapture.cpp and .h
+- /tmp/helios-source/plugins/DSCapture.cpp and .h
+- /tmp/helios-source/plugins/MFCapture.cpp and .h (Labs already has this as MfCaptureSource)
+
+## CurrentLabs Structure
+
+Labs plugins are in: app/plugins/
+Your existing capture is in: app/plugins/capture_card/
+
+## What to Add
+
+1. Create a capture plugin interface (like IPlugin)
+2. Add the OBS, DS, Magewell capture sources
+3. Add a device picker UI that lists available capture methods
+4. Let users select which capture to use
+
+Make Labs match Helios - users pick their capture method in settings.
+
+---
+
+Paste into your local Claude.

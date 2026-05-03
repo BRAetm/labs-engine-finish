@@ -1,0 +1,56 @@
+# Labs Launcher - Direct Titan USB Integration
+
+Copy and paste into your local Claude Code:
+
+---
+
+Add direct USB connection to Titan Two hardware. Labs should connect directly to Titan via USB HID - like Helios does, NOT using Gtuner app.
+
+## Direct USB Connection (TitanBridge approach)
+
+Labs IS the Titan host. Titan connects to your app via USB HID.
+
+### Implementation:
+
+1. **Find & Connect Titan Two**
+```cpp
+VID: 0x1993, PID: 0x00F0 (Collective Minds)
+// Use Windows HID API to find and open device
+```
+
+2. **Read Hardware State** (64 bytes @ 250Hz)
+```cpp
+ReadFile(hDevice, buffer, 64)
+// Returns: sticks, buttons, triggers from Titan hardware
+```
+
+3. **Send Virtual Input to Titan**
+```cpp
+WriteFile(hDevice, buffer, 64)
+// Your automation output goes here
+```
+
+4. **Upload GPC3 Scripts** (to memory slots 1-8)
+```cpp
+// Feature report 0x30: select slot
+// Feature report 0x31: upload chunk (60 bytes)
+// Feature report 0x32: finalize
+```
+
+### Controller Data Format (64 bytes):
+- Bytes 0-5: LX, LY, RX, RY, L2, R2
+- Byte 6: D-pad + face buttons
+- Byte 7: shoulder buttons
+- etc.
+
+### Use case:
+- Your CV/bot reads game state
+- Computes aim/shoot timing
+- Sends virtual controller to Titan (Titan sends to game)
+- Titan hardware does the actual input
+
+Make Labs the Titan host - direct USB connection. You'll need to implement the HID driver. Let me know what changes you make.
+
+---
+
+Paste this.
