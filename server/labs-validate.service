@@ -1,0 +1,22 @@
+[Unit]
+Description=Labs marketplace token validator
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+WorkingDirectory=/var/www/marketplace
+Environment=LABS_TOKENS_PATH=/var/www/marketplace/tokens.json
+Environment=LABS_VALIDATE_HOST=127.0.0.1
+Environment=LABS_VALIDATE_PORT=8787
+ExecStart=/usr/bin/python3 /var/www/marketplace/validate.py
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadOnlyPaths=/var/www/marketplace
+ReadWritePaths=
+
+[Install]
+WantedBy=multi-user.target

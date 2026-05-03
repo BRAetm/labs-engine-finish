@@ -52,6 +52,16 @@ public:
     virtual void pushState(const ControllerState& state) = 0;
 };
 
+// In-flight controller-state mutator. Engine's controller fan-out runs
+// every registered filter between the SHM-based InputOverride and the
+// downstream monitor/output sinks, on whichever source thread produced
+// the state. Implementations must be thread-safe.
+class LABSCORE_API IControllerStateFilter {
+public:
+    virtual ~IControllerStateFilter() = default;
+    virtual void apply(ControllerState& state) = 0;
+};
+
 class LABSCORE_API IControllerSource {
 public:
     virtual ~IControllerSource() = default;

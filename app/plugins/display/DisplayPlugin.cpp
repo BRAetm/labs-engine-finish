@@ -28,6 +28,15 @@ void DisplaySurface::setImage(const QImage& img)
     update();
 }
 
+void DisplaySurface::setDetections(const QVector<InferenceDetection>& dets)
+{
+    {
+        QMutexLocker lock(&m_mx);
+        m_detections = dets;
+    }
+    update();   // QWidget::update() is documented thread-safe — posts an event.
+}
+
 void DisplaySurface::paintEvent(QPaintEvent*)
 {
     QPainter p(this);
@@ -36,6 +45,7 @@ void DisplaySurface::paintEvent(QPaintEvent*)
     QImage scaled;
     QSize  target;
     qreal  dpr = 1.0;
+    QVector<InferenceDetection> dets;
     {
         QMutexLocker lock(&m_mx);
         img    = m_image;
@@ -53,6 +63,7 @@ void DisplaySurface::paintEvent(QPaintEvent*)
             m_scaledDirty = false;
         }
         scaled = m_scaled;
+        dets   = m_detections;
     }
 
     if (img.isNull()) {
@@ -62,9 +73,47 @@ void DisplaySurface::paintEvent(QPaintEvent*)
     }
 
     p.setRenderHint(QPainter::SmoothPixmapTransform, true);
-    const int x = (size().width()  - int(scaled.width()  / dpr)) / 2;
-    const int y = (size().height() - int(scaled.height() / dpr)) / 2;
+    const int sw = int(scaled.width()  / dpr);
+    const int sh = int(scaled.height() / dpr);
+    const int x  = (size().width()  - sw) / 2;
+    const int y  = (size().height() - sh) / 2;
     p.drawImage(x, y, scaled);
+
+    if (dets.isEmpty()) return;
+
+    // Overlay: detections are normalized 0..1 against the source frame.
+    // Resolve them against the rendered image rect (NOT the widget rect)
+    // so boxes align under the image's letterbox/pillarbox margins.
+    p.setRenderHint(QPainter::Antialiasing, true);
+    QFont font = p.font();
+    font.setPointSizeF(qMax(8.0, font.pointSizeF()));
+    p.setFont(font);
+    const QFontMetrics fm(font);
+
+    for (const InferenceDetection& d : dets) {
+        const int bx = x + int(d.x * sw);
+        const int by = y + int(d.y * sh);
+        const int bw = int(d.w * sw);
+        const int bh = int(d.h * sh);
+        if (bw <= 0 || bh <= 0) continue;
+
+        QPen pen(QColor(0, 220, 130));
+        pen.setWidth(2);
+        p.setPen(pen);
+        p.setBrush(Qt::NoBrush);
+        p.drawRect(bx, by, bw, bh);
+
+        const QString label = QStringLiteral("%1 %2%")
+            .arg(d.classId)
+            .arg(int(d.confidence * 100.0f + 0.5f));
+        const QSize ts = fm.size(0, label);
+        const int   pad = 3;
+        QRect tagRect(bx, by - ts.height() - pad * 2, ts.width() + pad * 2, ts.height() + pad * 2);
+        if (tagRect.top() < y) tagRect.moveTop(by);   // flip below if clipped above
+        p.fillRect(tagRect, QColor(0, 220, 130, 200));
+        p.setPen(QColor(10, 18, 12));
+        p.drawText(tagRect.adjusted(pad, pad, -pad, -pad), Qt::AlignLeft | Qt::AlignVCenter, label);
+    }
 }
 
 // ── DisplayPlugin ───────────────────────────────────────────────────────────
@@ -116,6 +165,24 @@ void DisplayPlugin::pushFrame(const Frame& frame)
     QPointer<DisplaySurface> surface = m_surface;
     QMetaObject::invokeMethod(surface, [surface, img]() {
         if (surface) surface->setImage(img);
+    }, Qt::QueuedConnection);
+}
+
+void DisplayPlugin::onResults(const InferenceResults& r)
+{
+    if (!m_surface) return;
+
+    // Drop replays — sequence is monotonic per-processor (see IFrameProcessor.h).
+    // Per-processor scope is fine here since the engine wires a single processor
+    // to this sink today; if multiple processors land, sequence collisions become
+    // possible and we'll need to key by source.
+    if (r.sequence != 0 && r.sequence == m_lastSeq) return;
+    m_lastSeq = r.sequence;
+
+    QPointer<DisplaySurface> surface = m_surface;
+    const QVector<InferenceDetection> dets = r.detections;   // deep-copy, refcounted
+    QMetaObject::invokeMethod(surface, [surface, dets]() {
+        if (surface) surface->setDetections(dets);
     }, Qt::QueuedConnection);
 }
 

@@ -58,6 +58,7 @@ private slots:
 
 private:
     class FanOutFrameSink;
+    class InferenceResultsFanOut;
 
     enum class Mode { Xbox = 0, PS = 1, Cloud = 2 };
 
@@ -76,7 +77,8 @@ private:
 
     std::unique_ptr<SettingsManager> m_settings;
     std::unique_ptr<PluginHost>      m_pluginHost;
-    std::unique_ptr<FanOutFrameSink> m_fanOut;
+    std::unique_ptr<FanOutFrameSink>        m_fanOut;
+    std::unique_ptr<InferenceResultsFanOut> m_resultsFanOut;
 
     QMap<QString, IFrameSource*>       m_frameSources;
     QMap<QString, IControllerSink*>    m_ctrlSinks;
