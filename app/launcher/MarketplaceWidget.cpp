@@ -2,8 +2,10 @@
 #include "LabsPaths.h"
 #include "SettingsManager.h"
 
+#include <QCheckBox>
 #include <QCoreApplication>
 #include <QComboBox>
+#include <QDateTime>
 #include <QDialog>
 #include <QDir>
 #include <QEventLoop>
@@ -23,6 +25,7 @@
 #include <QNetworkReply>
 #include <QNetworkRequest>
 #include <QPixmap>
+#include <QProcess>
 #include <QPushButton>
 #include <QRegularExpression>
 #include <QScrollArea>
@@ -31,6 +34,7 @@
 #include <QTextEdit>
 #include <QTimer>
 #include <QUrl>
+#include <QUrlQuery>
 #include <QVBoxLayout>
 #include <QtMath>
 
@@ -38,6 +42,16 @@ namespace Labs {
 
 namespace {
 constexpr auto kSettingsRemoteUrl = "marketplace/remote_url";  // optional remote manifest
+constexpr auto kSettingsKeyPrefix = "marketplace/keys/";       // appended with <slug>
+
+QString slugify(const QString& s)
+{
+    QString out = s.toLower();
+    out.replace(QRegularExpression(QStringLiteral("[^a-z0-9._-]+")), QStringLiteral("-"));
+    while (out.startsWith('-')) out.remove(0, 1);
+    while (out.endsWith('-'))   out.chop(1);
+    return out;
+}
 }
 
 MarketplaceWidget::MarketplaceWidget(SettingsManager* settings, QWidget* parent)
@@ -157,6 +171,24 @@ MarketplaceWidget::MarketplaceWidget(SettingsManager* settings, QWidget* parent)
 
 MarketplaceWidget::~MarketplaceWidget() = default;
 
+QString MarketplaceWidget::accessKeyFor(const QString& slug) const
+{
+    if (!m_settings || slug.isEmpty()) return {};
+    return m_settings->value(QString::fromLatin1(kSettingsKeyPrefix) + slug).toString();
+}
+
+void MarketplaceWidget::setAccessKeyFor(const QString& slug, const QString& key)
+{
+    if (!m_settings || slug.isEmpty()) return;
+    m_settings->setValue(QString::fromLatin1(kSettingsKeyPrefix) + slug, key);
+}
+
+void MarketplaceWidget::clearAccessKeyFor(const QString& slug)
+{
+    if (!m_settings || slug.isEmpty()) return;
+    m_settings->remove(QString::fromLatin1(kSettingsKeyPrefix) + slug);
+}
+
 QString MarketplaceWidget::cvScriptsDir() const
 {
     // Canonical user-scripts dir shared by every Labs binary. Anything the
@@ -187,17 +219,28 @@ void MarketplaceWidget::loadManifest()
         for (const auto& v : arr) {
             const auto o = v.toObject();
             MarketScript s;
+            s.slug         = o.value(QStringLiteral("slug")).toString();
             s.name         = o.value(QStringLiteral("name")).toString();
             s.description  = o.value(QStringLiteral("description")).toString();
             s.type         = o.value(QStringLiteral("type")).toString(QStringLiteral("py")).toLower();
+            // Tolerate both the original schema and the server's variant
+            // ("creator" instead of "author", "download_url" instead of "download").
             s.author       = o.value(QStringLiteral("author")).toString();
+            if (s.author.isEmpty())
+                s.author   = o.value(QStringLiteral("creator")).toString();
             s.version      = o.value(QStringLiteral("version")).toString();
             s.thumbnailUrl = o.value(QStringLiteral("thumbnail")).toString();
+            if (s.thumbnailUrl.isEmpty())
+                s.thumbnailUrl = o.value(QStringLiteral("thumbnail_url")).toString();
             s.downloadUrl  = o.value(QStringLiteral("download")).toString();
+            if (s.downloadUrl.isEmpty())
+                s.downloadUrl = o.value(QStringLiteral("download_url")).toString();
             s.localFilename = o.value(QStringLiteral("filename")).toString();
             s.likes        = o.value(QStringLiteral("likes")).toVariant().toLongLong();
             s.downloads    = o.value(QStringLiteral("downloads")).toVariant().toLongLong();
+            s.isPrivate    = o.value(QStringLiteral("is_private")).toBool(false);
             s.isLocal      = markLocal;
+            if (s.slug.isEmpty()) s.slug = slugify(s.name);
             // Mark installed if a file with the resolved name already exists.
             const QString fname = s.localFilename.isEmpty()
                                   ? QFileInfo(QUrl(s.downloadUrl).path()).fileName()
@@ -269,6 +312,7 @@ void MarketplaceWidget::saveLocalManifest()
     for (const auto& s : m_all) {
         if (!s.isLocal) continue;     // only local entries get persisted by Publish
         QJsonObject o;
+        o[QStringLiteral("slug")]        = s.slug;
         o[QStringLiteral("name")]        = s.name;
         o[QStringLiteral("description")] = s.description;
         o[QStringLiteral("type")]        = s.type;
@@ -279,6 +323,7 @@ void MarketplaceWidget::saveLocalManifest()
         o[QStringLiteral("filename")]    = s.localFilename;
         o[QStringLiteral("likes")]       = s.likes;
         o[QStringLiteral("downloads")]   = s.downloads;
+        o[QStringLiteral("is_private")]  = s.isPrivate;
         arr.append(o);
     }
     QFile f(localPath);
@@ -403,6 +448,14 @@ QWidget* MarketplaceWidget::buildCard(const MarketScript& s, int index)
     type->setObjectName(QStringLiteral("cardType"));
     type->setProperty("ttype", s.type);
     titleRow->addWidget(title, 1);
+    if (s.isPrivate) {
+        auto* lock = new QLabel(QStringLiteral("🔒 LOCKED"), body);
+        lock->setStyleSheet(QStringLiteral(
+            "color:#B45309;background:#FEF3C7;padding:3px 8px;border-radius:4px;"
+            "font-size:10px;font-weight:700;font-family:'Cascadia Mono','Consolas';"));
+        lock->setToolTip(QStringLiteral("Requires an access key from the creator."));
+        titleRow->addWidget(lock, 0, Qt::AlignTop);
+    }
     titleRow->addWidget(type, 0, Qt::AlignTop);
     bcol->addLayout(titleRow);
 
@@ -438,17 +491,42 @@ QWidget* MarketplaceWidget::buildCard(const MarketScript& s, int index)
     actionRow->addWidget(likes);
     actionRow->addStretch();
 
-    auto* btn = new QPushButton(body);
-    if (s.isInstalled) {
-        btn->setText(QStringLiteral("%1  ↓  Run").arg(humanCount(s.downloads)));
-        btn->setObjectName(QStringLiteral("cardActionAccent"));
-        connect(btn, &QPushButton::clicked, this, [this, index]() { runScript(index); });
+    const bool needsKey = s.isPrivate && !s.isInstalled && accessKeyFor(s.slug).isEmpty();
+
+    if (needsKey) {
+        // Locked + no key on file. Replace the install button with an input
+        // that captures the key and stores it under marketplace/keys/<slug>.
+        // The grid rebuilds after save, which then renders the Install button.
+        auto* keyEdit = new QLineEdit(body);
+        keyEdit->setPlaceholderText(QStringLiteral("Access key…"));
+        keyEdit->setEchoMode(QLineEdit::Password);
+        keyEdit->setMinimumWidth(120);
+        auto* save = new QPushButton(QStringLiteral("Save"), body);
+        save->setObjectName(QStringLiteral("cardActionAccent"));
+        const QString slug = s.slug;
+        auto commit = [this, slug, keyEdit]() {
+            const QString k = keyEdit->text().trimmed();
+            if (k.isEmpty()) return;
+            setAccessKeyFor(slug, k);
+            rebuildGrid();
+        };
+        connect(save,    &QPushButton::clicked,    this, commit);
+        connect(keyEdit, &QLineEdit::returnPressed, this, commit);
+        actionRow->addWidget(keyEdit, 1);
+        actionRow->addWidget(save);
     } else {
-        btn->setText(QStringLiteral("%1  ↓  Install").arg(humanCount(s.downloads)));
-        btn->setObjectName(QStringLiteral("cardAction"));
-        connect(btn, &QPushButton::clicked, this, [this, index]() { installScript(index); });
+        auto* btn = new QPushButton(body);
+        if (s.isInstalled) {
+            btn->setText(QStringLiteral("%1  ↓  Run").arg(humanCount(s.downloads)));
+            btn->setObjectName(QStringLiteral("cardActionAccent"));
+            connect(btn, &QPushButton::clicked, this, [this, index]() { runScript(index); });
+        } else {
+            btn->setText(QStringLiteral("%1  ↓  Install").arg(humanCount(s.downloads)));
+            btn->setObjectName(QStringLiteral("cardAction"));
+            connect(btn, &QPushButton::clicked, this, [this, index]() { installScript(index); });
+        }
+        actionRow->addWidget(btn);
     }
-    actionRow->addWidget(btn);
     bcol->addLayout(actionRow);
 
     col->addWidget(body);
@@ -488,8 +566,23 @@ void MarketplaceWidget::installScript(int index)
         return;
     }
 
-    // Remote download.
-    QNetworkRequest req((QUrl(s.downloadUrl)));
+    // Remote download. Private scripts append ?token=<stored-key>. Nginx
+    // hands the token to the validator via auth_request; bad keys come back
+    // as a 403, which we treat as "key invalid — clear it and re-prompt".
+    QUrl url(s.downloadUrl);
+    if (s.isPrivate) {
+        const QString key = accessKeyFor(s.slug);
+        if (key.isEmpty()) {
+            QMessageBox::warning(this, QStringLiteral("Install"),
+                QStringLiteral("This script is locked. Enter an access key first."));
+            return;
+        }
+        QUrlQuery q(url.query());
+        q.removeQueryItem(QStringLiteral("token"));
+        q.addQueryItem(QStringLiteral("token"), key);
+        url.setQuery(q);
+    }
+    QNetworkRequest req(url);
     req.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::NoLessSafeRedirectPolicy);
     auto* reply = m_nam->get(req);
     connect(reply, &QNetworkReply::finished, this, [this, reply, index]() {
@@ -497,10 +590,72 @@ void MarketplaceWidget::installScript(int index)
         if (index < 0 || index >= m_all.size()) return;
         MarketScript& s = m_all[index];
         if (reply->error() != QNetworkReply::NoError) {
+            const int http = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+            if (s.isPrivate && (http == 401 || http == 403)) {
+                clearAccessKeyFor(s.slug);
+                QMessageBox::warning(this, QStringLiteral("Install failed"),
+                    QStringLiteral("Access key was rejected. Enter a new one and try again."));
+                rebuildGrid();
+                return;
+            }
             QMessageBox::warning(this, QStringLiteral("Install failed"),
                 QStringLiteral("Download error: %1").arg(reply->errorString()));
             return;
         }
+        const QByteArray bytes = reply->readAll();
+
+        // Sniff the payload — a ZIP magic header (PK\x03\x04) means this is a
+        // multi-file product (xDrive3K bundles UI/CV/bridges + fonts), not a
+        // single .py drop. Fall through to the zip-install branch in that case.
+        const bool isZip =
+            bytes.size() >= 4 &&
+            bytes[0] == 'P' && bytes[1] == 'K' &&
+            quint8(bytes[2]) == 0x03 && quint8(bytes[3]) == 0x04;
+
+        if (isZip) {
+            // Stage to %TEMP% and shell out to bsdtar (Windows 10+ bundles
+            // tar.exe in System32; it groks zip natively). Avoids pulling in
+            // QuaZip / private QZipReader headers for a one-liner extraction.
+            QString tempZip = QDir::temp().filePath(
+                QStringLiteral("labs-install-%1.zip").arg(QString::number(QDateTime::currentMSecsSinceEpoch())));
+            QFile tf(tempZip);
+            if (!tf.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+                QMessageBox::warning(this, QStringLiteral("Install failed"),
+                    QStringLiteral("Cannot stage zip at %1").arg(tempZip));
+                return;
+            }
+            tf.write(bytes);
+            tf.close();
+
+            QDir().mkpath(cvScriptsDir());
+            QProcess tar;
+            tar.setWorkingDirectory(cvScriptsDir());
+            tar.start(QStringLiteral("tar"),
+                      {QStringLiteral("-xf"), tempZip, QStringLiteral("-C"), cvScriptsDir()});
+            const bool ok = tar.waitForFinished(30000) && tar.exitCode() == 0;
+            QFile::remove(tempZip);
+            if (!ok) {
+                QMessageBox::warning(this, QStringLiteral("Install failed"),
+                    QStringLiteral("Could not extract archive: %1")
+                        .arg(QString::fromLocal8Bit(tar.readAllStandardError()).trimmed()));
+                return;
+            }
+
+            // Entry point — manifest's "filename" is authoritative; if it's
+            // missing, fall back to <slug>.py and let runScript surface the
+            // error rather than guessing the wrong file.
+            const QString entry = s.localFilename.isEmpty()
+                ? (s.slug + QStringLiteral(".py"))
+                : s.localFilename;
+            s.isInstalled    = true;
+            s.localFilename  = entry;
+            s.downloads      = s.downloads + 1;
+            emit scriptListChanged();
+            saveLocalManifest();
+            rebuildGrid();
+            return;
+        }
+
         const QString localName = s.localFilename.isEmpty()
             ? QFileInfo(QUrl(s.downloadUrl).path()).fileName()
             : s.localFilename;
@@ -511,7 +666,7 @@ void MarketplaceWidget::installScript(int index)
                 QStringLiteral("Cannot write %1").arg(dst));
             return;
         }
-        out.write(reply->readAll());
+        out.write(bytes);
         s.isInstalled    = true;
         s.localFilename  = localName;
         s.downloads      = s.downloads + 1;
@@ -548,6 +703,7 @@ void MarketplaceWidget::onPublishClicked()
                        QStringLiteral("ennx"), QStringLiteral("henv")});
     auto* authorEdit  = new QLineEdit(&dlg);
     auto* versionEdit = new QLineEdit(&dlg); versionEdit->setText(QStringLiteral("v1.00"));
+    auto* privateBox  = new QCheckBox(QStringLiteral("Locked (require access key)"), &dlg);
     auto* fileEdit   = new QLineEdit(&dlg);
     auto* fileBrowse = new QPushButton(QStringLiteral("Browse…"), &dlg);
     fileBrowse->setObjectName(QStringLiteral("headerBtn"));
@@ -576,6 +732,7 @@ void MarketplaceWidget::onPublishClicked()
     form->addRow(QStringLiteral("Type"),     typeBox);
     form->addRow(QStringLiteral("Author"),   authorEdit);
     form->addRow(QStringLiteral("Version"),  versionEdit);
+    form->addRow(QStringLiteral(""),         privateBox);
     form->addRow(QStringLiteral("Script file"),  fileRow);
     form->addRow(QStringLiteral("Thumbnail (optional)"), thumbRow);
 
@@ -621,6 +778,7 @@ void MarketplaceWidget::onPublishClicked()
 
     // Add to m_all + persist local manifest. Also install it (copy to cv-scripts root).
     MarketScript ns;
+    ns.slug          = slug.toLower();
     ns.name          = name;
     ns.description   = descEdit->toPlainText().trimmed();
     ns.type          = typeBox->currentText();
@@ -633,6 +791,7 @@ void MarketplaceWidget::onPublishClicked()
     ns.downloads     = 0;
     ns.isLocal       = true;
     ns.isInstalled   = true;
+    ns.isPrivate     = privateBox->isChecked();
 
     // Also drop a copy into the live cv-scripts dir so it shows in the left rail.
     QFile::remove(cvScriptsDir() + "/" + fileName);

@@ -13,6 +13,7 @@
 #define TAKION_DATA_RESEND_WAKEUP_TIMEOUT_MS (TAKION_DATA_RESEND_TIMEOUT_MS/2)
 #define TAKION_DATA_RESEND_TRIES_MAX 25
 #define TAKION_SEND_BUFFER_SIZE 16
+#define TAKION_CONSECUTIVE_FAILURES_THRESHOLD 20  // Abort session after 20 packets fail consecutively
 
 #endif
 
@@ -41,6 +42,8 @@ LABS_EXPORT LabsErrorCode labs_takion_send_buffer_init(LabsTakionSendBuffer *sen
 	send_buffer->packets_count = 0;
 
 	send_buffer->should_stop = false;
+	send_buffer->consecutive_failures = 0;
+	send_buffer->session_aborted = false;
 
 	LabsErrorCode err = labs_mutex_init(&send_buffer->mutex, false);
 	if(err != LABS_ERR_SUCCESS)
@@ -111,6 +114,10 @@ LABS_EXPORT LabsErrorCode labs_takion_send_buffer_push(LabsTakionSendBuffer *sen
 	packet->last_send_ms = labs_time_now_monotonic_ms();
 	packet->buf = buf;
 	packet->buf_size = buf_size;
+
+	// Reset consecutive failures on new data push (connection may have recovered)
+	send_buffer->consecutive_failures = 0;
+	send_buffer->session_aborted = false;
 
 	LABS_LOGV(send_buffer->log, "Pushed seq num %#llx into Takion Send Buffer", (unsigned long long)seq_num);
 
@@ -184,6 +191,9 @@ LABS_EXPORT LabsErrorCode labs_takion_send_buffer_ack(LabsTakionSendBuffer *send
 	}
 
 	LABS_LOGV(send_buffer->log, "Acked seq num %#llx from Takion Send Buffer", (unsigned long long)seq_num);
+	
+	// Reset consecutive failures on successful ack
+	send_buffer->consecutive_failures = 0;
 
 	labs_mutex_unlock(&send_buffer->mutex);
 	return err;
@@ -247,6 +257,21 @@ static void takion_send_buffer_resend(LabsTakionSendBuffer *send_buffer)
 			if(packet->tries >= TAKION_DATA_RESEND_TRIES_MAX)
 			{
 				LABS_LOGI(send_buffer->log, "Hit max retries of %d tries... giving up on packet with seqnum %#llx", TAKION_DATA_RESEND_TRIES_MAX, (unsigned long long)packet->seq_num);
+				
+				// Track consecutive failures
+				send_buffer->consecutive_failures++;
+				LABS_LOGI(send_buffer->log, "Consecutive failures: %zu / %d", send_buffer->consecutive_failures, TAKION_CONSECUTIVE_FAILURES_THRESHOLD);
+				
+				// Check if we should abort the session
+				if(send_buffer->consecutive_failures >= TAKION_CONSECUTIVE_FAILURES_THRESHOLD && !send_buffer->session_aborted)
+				{
+					LABS_LOGE(send_buffer->log, "TAKION CONSECUTIVE FAILURES THRESHOLD EXCEEDED - ABORTING SESSION!");
+					send_buffer->session_aborted = true;
+					send_buffer->should_stop = true;
+					labs_cond_signal(&send_buffer->cond);
+					break;
+				}
+				
 				LabsSeqNum32 ack_seq_nums[TAKION_SEND_BUFFER_SIZE];
 				size_t ack_seq_nums_count;
 				labs_mutex_unlock(&send_buffer->mutex);

@@ -17,6 +17,7 @@ namespace Labs {
 class SettingsManager;
 
 struct MarketScript {
+    QString slug;          // stable id used for token lookup; defaults to a sanitised name
     QString name;
     QString description;
     QString type;          // py, gpc3, ennx, henv, etc.
@@ -29,6 +30,7 @@ struct MarketScript {
     qint64  downloads  = 0;
     bool    isLocal    = false;  // true if it lives only in the local manifest (not yet published)
     bool    isInstalled = false; // true if downloadUrl already saved to cv-scripts/
+    bool    isPrivate   = false; // locked — install needs an access key (?token=…)
 };
 
 class MarketplaceWidget : public QWidget {
@@ -58,6 +60,12 @@ private:
     QWidget* buildCard(const MarketScript& s, int index);
     void installScript(int index);
     void runScript(int index);
+
+    // Access-key helpers — keys are stored in SettingsManager under
+    // "marketplace/keys/<slug>" and sent as ?token=<key> on install.
+    QString accessKeyFor(const QString& slug) const;
+    void    setAccessKeyFor(const QString& slug, const QString& key);
+    void    clearAccessKeyFor(const QString& slug);
 
     SettingsManager*       m_settings = nullptr;
     QNetworkAccessManager* m_nam = nullptr;

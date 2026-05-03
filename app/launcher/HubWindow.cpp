@@ -1,5 +1,7 @@
 #include "HubWindow.h"
 #include "MarketplaceWidget.h"
+#include "IPlugin.h"
+#include "PluginHost.h"
 #include "SettingsManager.h"
 
 #include <QCoreApplication>
@@ -188,6 +190,23 @@ HubWindow::HubWindow(QWidget* parent)
     resize(1100, 680);
 
     m_settings = new SettingsManager(this);
+
+    // Discover plugins next to the exe (same path the engine uses, see
+    // LabsMainWindow.cpp:418). Load only — no initialize() call here.
+    // initialize() on plugins like ViGEm / DualSense / CvPython grabs
+    // exclusive hardware (controller slots, child processes), which would
+    // collide if the user then launches LabsEngine.exe from this Hub. The
+    // first feature in HubWindow that needs a specific plugin should call
+    // p->initialize(ctx) on just that plugin.
+    m_pluginHost = std::make_unique<PluginHost>(this);
+    const QString pluginDir = QCoreApplication::applicationDirPath() + QStringLiteral("/plugins");
+    const int loaded = m_pluginHost->loadAll(pluginDir);
+    qInfo().nospace() << "HubWindow: plugins loaded=" << loaded
+                      << " from " << pluginDir;
+    for (IPlugin* p : m_pluginHost->plugins()) {
+        qInfo().nospace() << "  - " << p->name() << " v" << p->version()
+                          << " by " << p->author();
+    }
 
     setStyleSheet(QString(
         "QMainWindow { background: %1; }"

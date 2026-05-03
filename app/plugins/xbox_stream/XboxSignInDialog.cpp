@@ -92,9 +92,18 @@ XboxSignInDialog::XboxSignInDialog(const QString& electronExe,
 
 XboxSignInDialog::~XboxSignInDialog()
 {
-    if (m_proc && m_proc->state() != QProcess::NotRunning) {
-        m_proc->terminate();
-        if (!m_proc->waitForFinished(1500)) m_proc->kill();
+    if (m_proc) {
+        // Disconnect from `this` BEFORE teardown. ~QObject destroys children
+        // in declaration order, so m_statusLabel (declared first) dies before
+        // m_proc (declared later).  ~QProcess then flushes a final finished()
+        // signal that re-enters our onFinished() lambda → setStatus(text) →
+        // m_statusLabel->setText(...), which dereferences a freed widget
+        // (rax = 0xddddddddddde055 in dump LabsEngine.exe.40796.dmp).
+        m_proc->disconnect(this);
+        if (m_proc->state() != QProcess::NotRunning) {
+            m_proc->terminate();
+            if (!m_proc->waitForFinished(1500)) m_proc->kill();
+        }
     }
 }
 

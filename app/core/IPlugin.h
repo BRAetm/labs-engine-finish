@@ -3,6 +3,7 @@
 #include "LabsCore.h"
 #include "FrameTypes.h"
 #include "InputTypes.h"
+#include "IFrameProcessor.h"
 
 #include <QObject>
 #include <QString>
@@ -51,6 +52,18 @@ public:
     virtual IFrameSink* frameSink() = 0;
 };
 
+class LABSCORE_API IFrameProcessorPlugin : public virtual IPlugin {
+public:
+    ~IFrameProcessorPlugin() override = default;
+    virtual IFrameProcessor* frameProcessor() = 0;
+};
+
+class LABSCORE_API IInferenceResultsSinkPlugin : public virtual IPlugin {
+public:
+    ~IInferenceResultsSinkPlugin() override = default;
+    virtual IInferenceResultsSink* inferenceResultsSink() = 0;
+};
+
 class LABSCORE_API IControllerSourcePlugin : public virtual IPlugin {
 public:
     ~IControllerSourcePlugin() override = default;
@@ -61,6 +74,12 @@ class LABSCORE_API IControllerSinkPlugin : public virtual IPlugin {
 public:
     ~IControllerSinkPlugin() override = default;
     virtual IControllerSink* controllerSink() = 0;
+};
+
+class LABSCORE_API IControllerStateFilterPlugin : public virtual IPlugin {
+public:
+    ~IControllerStateFilterPlugin() override = default;
+    virtual IControllerStateFilter* controllerStateFilter() = 0;
 };
 
 // Opt-in — plugin presents its own pairing / setup UI. Engine offers a

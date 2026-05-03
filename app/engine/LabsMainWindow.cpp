@@ -168,12 +168,42 @@ private:
     std::atomic<bool>         m_running{false};
 };
 
+// Inference results fan-out. One frame processor → many sinks (logger,
+// overlay, future assisted-aim). Synchronous: sinks run on the producing
+// processor's worker thread. Sinks must be quick (mutex+write or copy+
+// QueuedConnection) — anything heavier should marshal off the worker.
+class LabsMainWindow::InferenceResultsFanOut : public IInferenceResultsSink {
+public:
+    void addSink(IInferenceResultsSink* s) {
+        if (!s) return;
+        std::lock_guard<std::mutex> lk(m_mx);
+        m_sinks.push_back(s);
+    }
+    void onResults(const InferenceResults& r) override {
+        std::vector<IInferenceResultsSink*> snap;
+        {
+            std::lock_guard<std::mutex> lk(m_mx);
+            snap = m_sinks;
+        }
+        for (auto* s : snap) s->onResults(r);
+    }
+private:
+    std::vector<IInferenceResultsSink*> m_sinks;
+    std::mutex                          m_mx;
+};
+
 // Simple controller fan-out with one always-on monitor slot and a swappable
 // output slot (ViGEm vs PS, depending on mode).
 class FanOutCtrlSink : public IControllerSink {
 public:
     void setMonitor(IControllerSink* s)  { m_monitor = s; }
     void setOutput(IControllerSink* s)   { m_output  = s; }
+    // Filters mutate state in flight (assisted aim, accessibility tweaks).
+    // Registered once during plugin init; the vector is read-only after
+    // startup so the hot path doesn't need a lock.
+    void addFilter(IControllerStateFilter* f) {
+        if (f) m_filters.push_back(f);
+    }
     void pushState(const ControllerState& state) override {
         // Apply external SHM-based overrides (Labs2K shot release etc.) HERE
         // — at the fan-out — so EVERY source pushing through us sees the
@@ -181,12 +211,14 @@ public:
         // parallel pushes from XInputSource.
         ControllerState s = state;
         InputOverride::instance().apply(s);
+        for (auto* f : m_filters) f->apply(s);
         if (m_monitor) m_monitor->pushState(s);
         if (m_output)  m_output ->pushState(s);
     }
 private:
     IControllerSink* m_monitor = nullptr;
     IControllerSink* m_output  = nullptr;
+    std::vector<IControllerStateFilter*> m_filters;
 };
 static FanOutCtrlSink s_ctrlFanOut;
 
@@ -419,7 +451,13 @@ LabsMainWindow::LabsMainWindow(QWidget* parent)
     const int n = m_pluginHost->loadAll(pluginDir);
     PluginContext ctx;
     ctx.settings = m_settings.get();
-    m_fanOut = std::make_unique<FanOutFrameSink>();
+    m_fanOut        = std::make_unique<FanOutFrameSink>();
+    m_resultsFanOut = std::make_unique<InferenceResultsFanOut>();
+
+    // Collected during the plugin walk; wired up after the loop so every
+    // IInferenceResultsSinkPlugin has joined the fan-out before any
+    // processor's worker can fire its first onResults().
+    std::vector<IFrameProcessor*> processorsToStart;
 
     IControllerSource* cvCtrlSource = nullptr;
     IControllerSource* xinputCtrlSource = nullptr;
@@ -440,6 +478,27 @@ LabsMainWindow::LabsMainWindow(QWidget* parent)
             } else {
                 m_fanOut->addSink(kp->frameSink());
             }
+        }
+        // IFrameProcessor — async lane like CvPython. Inference is heavy
+        // by category and the realtime path must stay unblockable; the
+        // plugin also drops-old internally, so two layers of drop-old
+        // here is intentional, not redundant. start() is best-effort:
+        // if its settings (e.g. onnx_inference/model_path) aren't
+        // configured the plugin warns and pushFrame() becomes a no-op,
+        // so capture stays uncontaminated.
+        if (auto* fp = dynamic_cast<IFrameProcessorPlugin*>(p); fp) {
+            if (auto* proc = fp->frameProcessor()) {
+                m_fanOut->addAsyncSink(proc);
+                processorsToStart.push_back(proc);
+            }
+        }
+        if (auto* sp = dynamic_cast<IInferenceResultsSinkPlugin*>(p); sp) {
+            if (auto* sink = sp->inferenceResultsSink())
+                m_resultsFanOut->addSink(sink);
+        }
+        if (auto* fp = dynamic_cast<IControllerStateFilterPlugin*>(p); fp) {
+            if (auto* filter = fp->controllerStateFilter())
+                s_ctrlFanOut.addFilter(filter);
         }
         if (auto* sp = dynamic_cast<IControllerSourcePlugin*>(p); sp) {
             if      (p->name() == QStringLiteral("CV Python")) cvCtrlSource    = sp->controllerSource();
@@ -477,6 +536,15 @@ LabsMainWindow::LabsMainWindow(QWidget* parent)
     // All plugin sinks have registered — safe to start the async worker now.
     // Starting it earlier would race addAsyncSink / addSink mutations.
     if (m_fanOut) m_fanOut->startWorker();
+
+    // Now that every IInferenceResultsSinkPlugin has joined the fan-out,
+    // hand each processor its sink and start its worker. Doing this here
+    // (rather than inline during the plugin walk) means no processor can
+    // emit a result before all subscribers are wired in.
+    for (IFrameProcessor* proc : processorsToStart) {
+        proc->setResultsSink(m_resultsFanOut.get());
+        proc->start();
+    }
 
     // Cross-DLL queued signals carrying quintptr need explicit metatype
     // registration on the engine side (the plugin's MOC registered it on the
@@ -1551,7 +1619,9 @@ void LabsMainWindow::spawnXboxSessionScript(int sessionId)
     proc->setProgram(QStringLiteral("python"));
     QStringList args;
     args << scriptPath
-         << QStringLiteral("--session-id") << QString::number(sessionId);
+         << QStringLiteral("--labs-pid")   << QString::number(QCoreApplication::applicationPid())
+         << QStringLiteral("--session-id") << QString::number(sessionId)
+         << QStringLiteral("--session")    << QString::number(sessionId);
     if (m_perfLiteBtn && m_perfLiteBtn->isChecked()) args << QStringLiteral("--low-end");
     proc->setArguments(args);
     proc->setProcessChannelMode(QProcess::MergedChannels);
@@ -2043,7 +2113,15 @@ void LabsMainWindow::onRunScript()
     // Build the script arg list. The perf toggle drives both:
     //   Low End  → --low-end  (60fps mss, every-2 frame, 250Hz passthrough)
     //   High End → --target-fps 240  (BetterCam at its real cap)
+    //
+    // --labs-pid + --session are what unlock the SHM frame path: scripts that
+    // implement CV (xDrive3K, Labs2K, …) read frames from a SHM block named
+    // Labs_<labs-pid>_Frame_<session>. PS Remote Play stamps sessionId=1, so
+    // defaulting --session to 1 makes the manual Run path work end-to-end on
+    // the PS path. xCloud uses spawnXboxSessionScript with its own session id.
     QStringList args { path };
+    args << QStringLiteral("--labs-pid") << QString::number(QCoreApplication::applicationPid());
+    args << QStringLiteral("--session")  << QStringLiteral("1");
     const bool low = m_perfLiteBtn && m_perfLiteBtn->isChecked();
     if (low) {
         args << QStringLiteral("--low-end");

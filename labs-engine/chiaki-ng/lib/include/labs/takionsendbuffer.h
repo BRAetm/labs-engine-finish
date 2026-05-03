@@ -31,6 +31,14 @@ typedef struct labs_takion_send_buffer_t
 	LabsCond cond;
 	bool should_stop;
 	LabsThread thread;
+
+	// Consecutive-failure cap.  When TAKION_DATA_RESEND_TRIES_MAX exhausts
+	// this many packets in a row without an ack, the session is aborted —
+	// stops the retransmit storm chiaki-ng would otherwise run forever when
+	// the peer is unreachable.  Reset on push() (new data implies the link
+	// might be coming back) and on ack() (proof it did).
+	size_t consecutive_failures;
+	bool   session_aborted;
 } LabsTakionSendBuffer;
 
 

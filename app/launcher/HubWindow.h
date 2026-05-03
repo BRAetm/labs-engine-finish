@@ -3,6 +3,8 @@
 #include <QMainWindow>
 #include <QPointer>
 
+#include <memory>
+
 class QLabel;
 class QPushButton;
 class QStackedWidget;
@@ -10,6 +12,7 @@ class QWidget;
 
 namespace Labs {
 
+class PluginHost;
 class SettingsManager;
 class MarketplaceWidget;
 class SidebarEntry;
@@ -51,6 +54,7 @@ private:
     QString resolveLabsEngineExe() const;
 
     SettingsManager*           m_settings   = nullptr;
+    std::unique_ptr<PluginHost> m_pluginHost;
     QStackedWidget*            m_heroStack  = nullptr;
     QList<SidebarEntry*>       m_sidebarEntries;
     int                        m_selectedIndex = 0;

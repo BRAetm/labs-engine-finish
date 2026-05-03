@@ -2,9 +2,13 @@ add_library(LabsCore SHARED
     LabsCore.h
     FrameTypes.h
     InputTypes.h
+    IFrameProcessor.h
+    ICaptureProvider.h
     IPlugin.h
     PluginHost.h
     PluginHost.cpp
+    SharedFrameReader.h
+    SharedFrameReader.cpp
     SettingsManager.h
     SettingsManager.cpp
     InputOverride.h
